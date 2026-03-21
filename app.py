@@ -658,10 +658,12 @@ with st.expander("📋  Screening criteria reference"):
 
         pKa pipeline in this build:
         1. `input_pka_acidic` / `input_pka_basic` / `input_pka` from the file
-        2. exact **DrugBank** lookup by compound name (public page parsing)
-        3. **site-aware heuristic** pKa predictor (SMARTS-based)
-        4. **Dimorphite-DL** protonation state enumeration at the selected pH
-        5. pH-specific ionization and logD calculation
+        2. **ChEMBL** API lookup (molecule properties, InChIKey / SMILES / name)
+        3. **PubChem** PUG-View lookup (Dissociation Constants annotations)
+        4. **DrugBank** web lookup by compound name (public page parsing)
+        5. **site-aware heuristic** pKa predictor (SMARTS-based fallback)
+        6. **Dimorphite-DL** protonation state enumeration at the selected pH
+        7. pH-specific ionization and logD calculation
 
         The main pKa column shows a single value only when chemically meaningful
         (simple monoprotic acid/base). For multiprotic, ampholytic, or polyphenolic

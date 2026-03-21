@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-"""Ionization analysis: DrugBank lookup → site-aware pKa heuristic → Dimorphite-DL → pH-specific ionization → logD.
+"""Ionization analysis: ChEMBL/PubChem → DrugBank → heuristic → Dimorphite-DL → ionization → logD.
 
 Pipeline
 --------
 1. Canonicalize molecule (caller provides canonical SMILES).
-2. Try exact DrugBank lookup (name → InChIKey → canonical SMILES).
-3. If no reliable match → enhanced site-aware heuristic pKa predictor.
-4. Run Dimorphite-DL around user pH for protonation-state enumeration.
-5. Decide whether one representative pKa is chemically meaningful.
-6. Compute pH-specific ionization (fraction unionized, net charge).
-7. Compute pH-specific logD.
-8. Return full provenance metadata.
+2. Try ChEMBL API lookup (by InChIKey / canonical SMILES / name).
+3. If no ChEMBL match → try PubChem PUG-View (Dissociation Constants).
+4. If no PubChem match → try DrugBank web lookup.
+5. If no DrugBank match → site-aware heuristic pKa predictor.
+6. Run Dimorphite-DL around user pH for protonation-state enumeration.
+7. Decide whether one representative pKa is chemically meaningful.
+8. Compute pH-specific ionization (fraction unionized, net charge).
+9. Compute pH-specific logD.
+10. Return full provenance metadata.
 
 Notes
 -----
 - pH is always passed explicitly by the caller; never hardcoded.
+- ChEMBL and PubChem are queried first as structured database APIs.
 - DrugBank matching is conservative: only exact or highly reliable matches are used.
 - For polyphenols / multiprotic molecules, pKa column is left blank.
 """
@@ -23,6 +26,7 @@ Notes
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Literal
+import json as _json
 import logging
 import math
 import os
@@ -40,13 +44,14 @@ DEFAULT_PH: float = 5.5
 IonType = Literal["acid", "base"]
 
 # ---------------------------------------------------------------------------
-# DrugBank configuration
+# HTTP / API configuration
 # ---------------------------------------------------------------------------
-_DRUGBANK_SEARCH_URL = "https://go.drugbank.com/unearth/q?query={query}&searcher=drugs"
-_DRUGBANK_BASE_URL = "https://go.drugbank.com"
-_HTTP_TIMEOUT = float(os.getenv("EPIDERMAL_DRUGBANK_TIMEOUT", "8.0"))
-_MAX_CANDIDATES = int(os.getenv("EPIDERMAL_DRUGBANK_MAX_CANDIDATES", "5"))
-_DISABLE_LIVE_LOOKUP = os.getenv("EPIDERMAL_DISABLE_DRUGBANK_LOOKUP", "0") == "1"
+_HTTP_TIMEOUT = float(os.getenv("EPIDERMAL_HTTP_TIMEOUT", "8.0"))
+_DISABLE_LIVE_LOOKUP = os.getenv("EPIDERMAL_DISABLE_LIVE_LOOKUP", "0") == "1"
+# Legacy env-var alias keeps backward compat
+if os.getenv("EPIDERMAL_DISABLE_DRUGBANK_LOOKUP", "0") == "1":
+    _DISABLE_LIVE_LOOKUP = True
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; EpidermalBarrierScreen/0.3; "
@@ -54,6 +59,27 @@ _HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# ---------------------------------------------------------------------------
+# ChEMBL API configuration
+# ---------------------------------------------------------------------------
+_CHEMBL_API_BASE = "https://www.ebi.ac.uk/chembl/api/data"
+_DISABLE_CHEMBL = os.getenv("EPIDERMAL_DISABLE_CHEMBL", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# PubChem API configuration
+# ---------------------------------------------------------------------------
+_PUBCHEM_PUG_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+_PUBCHEM_PUGVIEW_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view"
+_DISABLE_PUBCHEM = os.getenv("EPIDERMAL_DISABLE_PUBCHEM", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# DrugBank configuration
+# ---------------------------------------------------------------------------
+_DRUGBANK_SEARCH_URL = "https://go.drugbank.com/unearth/q?query={query}&searcher=drugs"
+_DRUGBANK_BASE_URL = "https://go.drugbank.com"
+_MAX_CANDIDATES = int(os.getenv("EPIDERMAL_DRUGBANK_MAX_CANDIDATES", "5"))
+_DISABLE_DRUGBANK = os.getenv("EPIDERMAL_DISABLE_DRUGBANK", "0") == "1"
 
 # Match quality thresholds for DrugBank
 _DRUGBANK_EXACT_THRESHOLD = 90   # score >= 90 → exact
@@ -152,7 +178,276 @@ def _compiled_patterns() -> list[tuple[Chem.Mol, str, IonType, float]]:
 
 
 # ---------------------------------------------------------------------------
-# Part 1 — DrugBank lookup
+# Generic HTTP helper
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=512)
+def _fetch_json(url: str) -> dict | list | None:
+    """GET *url* and parse JSON. Returns None on any error."""
+    if _DISABLE_LIVE_LOOKUP:
+        return None
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=_HTTP_TIMEOUT)
+        if not resp.ok:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ChEMBL API lookup
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=256)
+def _chembl_lookup_by_inchikey(inchikey: str) -> dict[str, Any] | None:
+    """Query ChEMBL molecule endpoint by standard InChIKey."""
+    if _DISABLE_CHEMBL or _DISABLE_LIVE_LOOKUP or not inchikey:
+        return None
+    url = f"{_CHEMBL_API_BASE}/molecule/{inchikey}.json"
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+    return _extract_chembl_pka(data)
+
+
+@lru_cache(maxsize=256)
+def _chembl_search_by_smiles(canonical_smiles: str) -> dict[str, Any] | None:
+    """Search ChEMBL by canonical SMILES (flexmatch)."""
+    if _DISABLE_CHEMBL or _DISABLE_LIVE_LOOKUP or not canonical_smiles:
+        return None
+    encoded = quote_plus(canonical_smiles)
+    url = (
+        f"{_CHEMBL_API_BASE}/molecule.json"
+        f"?molecule_structures__canonical_smiles__flexmatch={encoded}&limit=1"
+    )
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+    mols = data.get("molecules", [])
+    if not mols:
+        return None
+    return _extract_chembl_pka(mols[0])
+
+
+@lru_cache(maxsize=256)
+def _chembl_search_by_name(name: str) -> dict[str, Any] | None:
+    """Search ChEMBL molecule by name."""
+    if _DISABLE_CHEMBL or _DISABLE_LIVE_LOOKUP or not name:
+        return None
+    encoded = quote_plus(name.strip())
+    url = f"{_CHEMBL_API_BASE}/molecule/search.json?q={encoded}&limit=3"
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+    mols = data.get("molecules", [])
+    if not mols:
+        return None
+    # Pick first result whose pref_name matches closely
+    name_norm = _normalize_name(name)
+    for mol_entry in mols:
+        pref = mol_entry.get("pref_name") or ""
+        if _normalize_name(pref) == name_norm:
+            result = _extract_chembl_pka(mol_entry)
+            if result:
+                return result
+    # Fallback to first result if it has pKa
+    return _extract_chembl_pka(mols[0])
+
+
+def _extract_chembl_pka(mol_data: dict) -> dict[str, Any] | None:
+    """Extract pKa fields from a ChEMBL molecule JSON object."""
+    props = mol_data.get("molecule_properties") or {}
+    acd_pka = _safe_float(props.get("acd_pka"))
+    acd_logp = _safe_float(props.get("acd_logp"))
+
+    chembl_id = mol_data.get("molecule_chembl_id")
+    pref_name = mol_data.get("pref_name")
+
+    if acd_pka is None:
+        return None
+
+    # ChEMBL acd_pka is the "most acidic pKa" from ACD/Labs or ChemAxon.
+    # It can be acidic or basic depending on the molecule.
+    # We store it and let the caller decide.
+    return {
+        "chembl_id": chembl_id,
+        "chembl_name": pref_name,
+        "chembl_acd_pka": acd_pka,
+        "chembl_acd_logp": acd_logp,
+    }
+
+
+def _chembl_lookup(
+    *,
+    canonical_smiles: str | None,
+    name: str | None,
+    inchikey: str | None,
+) -> dict[str, Any] | None:
+    """Try ChEMBL lookup: InChIKey → SMILES → name."""
+    if _DISABLE_CHEMBL or _DISABLE_LIVE_LOOKUP:
+        return None
+
+    # InChIKey is the most reliable identifier
+    if inchikey:
+        result = _chembl_lookup_by_inchikey(inchikey)
+        if result:
+            return result
+
+    if canonical_smiles:
+        result = _chembl_search_by_smiles(canonical_smiles)
+        if result:
+            return result
+
+    if name and name.strip():
+        result = _chembl_search_by_name(name)
+        if result:
+            return result
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PubChem API lookup
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=256)
+def _pubchem_get_cid_by_inchikey(inchikey: str) -> int | None:
+    """Resolve InChIKey → PubChem CID."""
+    if not inchikey:
+        return None
+    url = f"{_PUBCHEM_PUG_BASE}/compound/inchikey/{inchikey}/cids/JSON"
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+    cids = data.get("IdentifierList", {}).get("CID", [])
+    return cids[0] if cids else None
+
+
+@lru_cache(maxsize=256)
+def _pubchem_get_cid_by_smiles(smiles: str) -> int | None:
+    """Resolve canonical SMILES → PubChem CID."""
+    if not smiles:
+        return None
+    encoded = quote_plus(smiles)
+    url = f"{_PUBCHEM_PUG_BASE}/compound/smiles/{encoded}/cids/JSON"
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+    cids = data.get("IdentifierList", {}).get("CID", [])
+    return cids[0] if cids else None
+
+
+@lru_cache(maxsize=256)
+def _pubchem_get_cid_by_name(name: str) -> int | None:
+    """Resolve compound name → PubChem CID."""
+    if not name:
+        return None
+    encoded = quote_plus(name.strip())
+    url = f"{_PUBCHEM_PUG_BASE}/compound/name/{encoded}/cids/JSON"
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+    cids = data.get("IdentifierList", {}).get("CID", [])
+    return cids[0] if cids else None
+
+
+@lru_cache(maxsize=256)
+def _pubchem_get_pka_from_pugview(cid: int) -> dict[str, Any] | None:
+    """Fetch pKa (Dissociation Constants) from PubChem PUG-View annotations."""
+    url = (
+        f"{_PUBCHEM_PUGVIEW_BASE}/data/compound/{cid}/JSON"
+        f"?heading=Dissociation+Constants"
+    )
+    data = _fetch_json(url)
+    if not isinstance(data, dict):
+        return None
+
+    # Navigate the PUG-View nested structure to find pKa text values.
+    # Structure: Record → Section[] → Section[] → Information[] → Value
+    pka_values: list[float] = []
+    pka_texts: list[str] = []
+
+    def _walk_sections(sections: list) -> None:
+        for sec in sections:
+            if not isinstance(sec, dict):
+                continue
+            # Recurse into sub-sections
+            if "Section" in sec:
+                _walk_sections(sec["Section"])
+            # Extract Information entries
+            for info in sec.get("Information", []):
+                val = info.get("Value", {})
+                # Try StringWithMarkup (most common for pKa annotations)
+                for swm in val.get("StringWithMarkup", []):
+                    text = swm.get("String", "")
+                    if text:
+                        pka_texts.append(text)
+                        # Extract numeric pKa values from text
+                        for m in re.finditer(
+                            r"(?:pKa|pka|PKA)\s*[=:≈~]?\s*(-?\d+(?:\.\d+)?)",
+                            text, re.IGNORECASE,
+                        ):
+                            v = _safe_float(m.group(1))
+                            if v is not None:
+                                pka_values.append(v)
+                        # Also match bare floats that look like pKa
+                        for m in re.finditer(
+                            r"(?<!\d)(-?\d{1,2}\.\d{1,2})(?!\d)",
+                            text,
+                        ):
+                            v = _safe_float(m.group(1))
+                            if v is not None and -2 <= v <= 16:
+                                if v not in pka_values:
+                                    pka_values.append(v)
+                # Try Number directly
+                num = val.get("Number")
+                if isinstance(num, (list,)):
+                    for n in num:
+                        v = _safe_float(n)
+                        if v is not None:
+                            pka_values.append(v)
+                elif num is not None:
+                    v = _safe_float(num)
+                    if v is not None:
+                        pka_values.append(v)
+
+    record = data.get("Record", {})
+    _walk_sections(record.get("Section", []))
+
+    if not pka_values:
+        return None
+
+    return {
+        "pubchem_cid": cid,
+        "pubchem_pka_values": pka_values,
+        "pubchem_pka_texts": pka_texts,
+    }
+
+
+def _pubchem_lookup(
+    *,
+    canonical_smiles: str | None,
+    name: str | None,
+    inchikey: str | None,
+) -> dict[str, Any] | None:
+    """Try PubChem pKa lookup: InChIKey → SMILES → name → PUG-View."""
+    if _DISABLE_PUBCHEM or _DISABLE_LIVE_LOOKUP:
+        return None
+
+    cid: int | None = None
+
+    if inchikey:
+        cid = _pubchem_get_cid_by_inchikey(inchikey)
+    if cid is None and canonical_smiles:
+        cid = _pubchem_get_cid_by_smiles(canonical_smiles)
+    if cid is None and name and name.strip():
+        cid = _pubchem_get_cid_by_name(name)
+    if cid is None:
+        return None
+
+    return _pubchem_get_pka_from_pugview(cid)
+
+
+# ---------------------------------------------------------------------------
+# DrugBank web-scraping lookup
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=256)
 def _fetch_url(url: str) -> str | None:
@@ -292,7 +587,7 @@ def _live_drugbank_lookup(
     inchikey: str | None,
 ) -> dict[str, Any] | None:
     """Try DrugBank lookup with priority: name → InChIKey → canonical SMILES."""
-    if _DISABLE_LIVE_LOOKUP:
+    if _DISABLE_DRUGBANK or _DISABLE_LIVE_LOOKUP:
         return None
 
     queries: list[str] = []
@@ -530,7 +825,7 @@ def _dominant_charge_class(expected_net_charge: float | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Part 1+2 — pKa source resolution (input → DrugBank → heuristic)
+# pKa source resolution: input → ChEMBL → PubChem → DrugBank → heuristic
 # ---------------------------------------------------------------------------
 def _site_pka_lists_from_source(
     *,
@@ -542,13 +837,23 @@ def _site_pka_lists_from_source(
     input_pka_acidic: float | None = None,
     input_pka_basic: float | None = None,
 ) -> tuple[list[float], list[float], str, dict[str, Any]]:
-    """Return acidic/basic pKa lists, source tag, and DrugBank metadata.
+    """Return acidic/basic pKa lists, source tag, and database metadata.
+
+    Cascade: input → ChEMBL → PubChem → DrugBank → heuristic.
 
     Returns
     -------
-    acidic_list, basic_list, pka_source, drugbank_meta
+    acidic_list, basic_list, pka_source, db_meta
     """
-    drugbank_meta: dict[str, Any] = {
+    db_meta: dict[str, Any] = {
+        # ChEMBL
+        "chembl_id": None,
+        "chembl_name": None,
+        "chembl_acd_pka": None,
+        # PubChem
+        "pubchem_cid": None,
+        "pubchem_pka_values": None,
+        # DrugBank
         "drugbank_match_status": "not_attempted",
         "drugbank_name": None,
         "drugbank_url": None,
@@ -557,7 +862,7 @@ def _site_pka_lists_from_source(
         "physiological_charge_drugbank": None,
     }
 
-    # Priority 0: user-provided pKa values from input file
+    # ── Priority 0: user-provided pKa values from input file ──
     if input_pka_acidic is not None or input_pka_basic is not None:
         acidic = [input_pka_acidic] if input_pka_acidic is not None else []
         basic = [input_pka_basic] if input_pka_basic is not None else []
@@ -567,15 +872,64 @@ def _site_pka_lists_from_source(
                 basic = [input_pka]
             else:
                 acidic = [input_pka]
-        return acidic, basic, "input", drugbank_meta
+        return acidic, basic, "input", db_meta
 
     if input_pka is not None:
         ion_class = classify_ionization(sites)
         if ion_class == "base":
-            return [], [input_pka], "input", drugbank_meta
-        return [input_pka], [], "input", drugbank_meta
+            return [], [input_pka], "input", db_meta
+        return [input_pka], [], "input", db_meta
 
-    # Priority 1: Live DrugBank lookup
+    # Helper to classify a single pKa value as acidic or basic
+    def _assign_single_pka(pka_val: float) -> tuple[list[float], list[float]]:
+        ion_class = classify_ionization(sites)
+        if ion_class == "base":
+            return [], [pka_val]
+        return [pka_val], []
+
+    # ── Priority 1: ChEMBL API ──
+    chembl = _chembl_lookup(
+        canonical_smiles=canonical_smiles,
+        name=name,
+        inchikey=inchikey,
+    )
+    if chembl is not None:
+        db_meta["chembl_id"] = chembl.get("chembl_id")
+        db_meta["chembl_name"] = chembl.get("chembl_name")
+        db_meta["chembl_acd_pka"] = chembl.get("chembl_acd_pka")
+
+        pka_val = chembl["chembl_acd_pka"]
+        if pka_val is not None:
+            acidic, basic = _assign_single_pka(pka_val)
+            return acidic, basic, "chembl", db_meta
+
+    # ── Priority 2: PubChem PUG-View (Dissociation Constants) ──
+    pubchem = _pubchem_lookup(
+        canonical_smiles=canonical_smiles,
+        name=name,
+        inchikey=inchikey,
+    )
+    if pubchem is not None:
+        db_meta["pubchem_cid"] = pubchem.get("pubchem_cid")
+        pka_vals = pubchem.get("pubchem_pka_values", [])
+        db_meta["pubchem_pka_values"] = pka_vals
+
+        if pka_vals:
+            # PubChem may return multiple pKa values; separate into acidic/basic
+            # using site detection as a guide
+            ion_class = classify_ionization(sites)
+            if ion_class == "base":
+                return [], pka_vals, "pubchem", db_meta
+            elif ion_class == "ampholyte":
+                # With multiple values, assign lowest as acidic, highest as basic
+                sorted_vals = sorted(pka_vals)
+                mid = len(sorted_vals) // 2
+                return sorted_vals[:mid] or sorted_vals[:1], sorted_vals[mid:] or [], "pubchem", db_meta
+            else:
+                # acid or non_ionizable with pKa data → treat as acidic
+                return pka_vals, [], "pubchem", db_meta
+
+    # ── Priority 3: DrugBank web-scraping ──
     entry = _live_drugbank_lookup(
         canonical_smiles=canonical_smiles,
         name=name,
@@ -583,35 +937,34 @@ def _site_pka_lists_from_source(
     )
 
     match_status = _drugbank_match_status(entry)
-    drugbank_meta["drugbank_match_status"] = match_status
+    db_meta["drugbank_match_status"] = match_status
 
     if entry is not None:
-        drugbank_meta["drugbank_name"] = entry.get("name")
-        drugbank_meta["drugbank_url"] = entry.get("source_url")
-        drugbank_meta["acidic_pka_drugbank"] = entry.get("strongest_acidic_pka")
-        drugbank_meta["basic_pka_drugbank"] = entry.get("strongest_basic_pka")
-        drugbank_meta["physiological_charge_drugbank"] = entry.get("physiological_charge")
+        db_meta["drugbank_name"] = entry.get("name")
+        db_meta["drugbank_url"] = entry.get("source_url")
+        db_meta["acidic_pka_drugbank"] = entry.get("strongest_acidic_pka")
+        db_meta["basic_pka_drugbank"] = entry.get("strongest_basic_pka")
+        db_meta["physiological_charge_drugbank"] = entry.get("physiological_charge")
 
     if match_status == "exact":
-        # Use DrugBank pKa values
-        acidic: list[float] = []
-        basic: list[float] = []
+        acidic_db: list[float] = []
+        basic_db: list[float] = []
         acid_pka = _safe_float(entry.get("strongest_acidic_pka"))  # type: ignore[union-attr]
         base_pka = _safe_float(entry.get("strongest_basic_pka"))  # type: ignore[union-attr]
         if acid_pka is not None:
-            acidic.append(acid_pka)
+            acidic_db.append(acid_pka)
         if base_pka is not None:
-            basic.append(base_pka)
-        if acidic or basic:
-            return acidic, basic, "drugbank_live", drugbank_meta
+            basic_db.append(base_pka)
+        if acidic_db or basic_db:
+            return acidic_db, basic_db, "drugbank_live", db_meta
 
-    # If DrugBank match is uncertain, do NOT use its pKa — fall through to heuristic
+    # If DrugBank match is uncertain, do NOT use its pKa — fall through
     # but keep the metadata for provenance
 
-    # Priority 2: Site-aware heuristic pKa prediction
+    # ── Priority 4: Site-aware heuristic pKa prediction ──
     acidic = [s.heuristic_pka for s in sites if s.ion_type == "acid"]
     basic = [s.heuristic_pka for s in sites if s.ion_type == "base"]
-    return acidic, basic, "heuristic_site_rules", drugbank_meta
+    return acidic, basic, "heuristic_site_rules", db_meta
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +981,12 @@ def _assess_pka_confidence(
     """Return a confidence label for the pKa prediction."""
     if pka_source == "input":
         return "high"
+    if pka_source == "pubchem":
+        return "high"  # experimental annotations
     if pka_source == "drugbank_live":
         return "high"
+    if pka_source == "chembl":
+        return "moderate"  # ChemAxon predicted values
 
     # Heuristic site rules
     if ion_class == "non_ionizable":
@@ -671,7 +1028,7 @@ def analyze_ionization(
     """Analyze ionization and pH-corrected lipophilicity for one molecule.
 
     Implements the full pipeline:
-    DrugBank → heuristic pKa → Dimorphite-DL → ionization → logD
+    ChEMBL → PubChem → DrugBank → heuristic pKa → Dimorphite-DL → ionization → logD
     """
     try:
         inchikey = inchi.MolToInchiKey(mol)
@@ -682,7 +1039,7 @@ def analyze_ionization(
     ion_class = classify_ionization(sites)
 
     # --- pKa resolution ---
-    acidic_pkas, basic_pkas, pka_source, drugbank_meta = _site_pka_lists_from_source(
+    acidic_pkas, basic_pkas, pka_source, db_meta = _site_pka_lists_from_source(
         sites=sites,
         canonical_smiles=canonical_smiles,
         name=name,
@@ -713,7 +1070,7 @@ def analyze_ionization(
     )
 
     # Merge DrugBank pka_note
-    if drugbank_meta.get("drugbank_match_status") == "uncertain":
+    if db_meta.get("drugbank_match_status") == "uncertain":
         extra = "drugbank_match_uncertain_pKa_not_used"
         pka_note = f"{pka_note}; {extra}" if pka_note else extra
 
@@ -800,14 +1157,29 @@ def analyze_ionization(
         "pka_prediction_method": pka_source,
         "pka_confidence": pka_confidence,
         "pka_note": pka_note,
-        "lookup_match_name": drugbank_meta.get("drugbank_name") or name,
+        "lookup_match_name": (
+            db_meta.get("chembl_name")
+            or db_meta.get("drugbank_name")
+            or name
+        ),
+        # ChEMBL metadata
+        "chembl_id": db_meta.get("chembl_id"),
+        "chembl_name": db_meta.get("chembl_name"),
+        "chembl_acd_pka": db_meta.get("chembl_acd_pka"),
+        # PubChem metadata
+        "pubchem_cid": db_meta.get("pubchem_cid"),
+        "pubchem_pka_values": (
+            "; ".join(f"{v:.2f}" for v in db_meta["pubchem_pka_values"])
+            if db_meta.get("pubchem_pka_values")
+            else None
+        ),
         # DrugBank metadata
-        "drugbank_match_status": drugbank_meta["drugbank_match_status"],
-        "drugbank_name": drugbank_meta["drugbank_name"],
-        "drugbank_url": drugbank_meta["drugbank_url"],
-        "acidic_pka_drugbank": drugbank_meta["acidic_pka_drugbank"],
-        "basic_pka_drugbank": drugbank_meta["basic_pka_drugbank"],
-        "physiological_charge_drugbank": drugbank_meta["physiological_charge_drugbank"],
+        "drugbank_match_status": db_meta["drugbank_match_status"],
+        "drugbank_name": db_meta["drugbank_name"],
+        "drugbank_url": db_meta["drugbank_url"],
+        "acidic_pka_drugbank": db_meta["acidic_pka_drugbank"],
+        "basic_pka_drugbank": db_meta["basic_pka_drugbank"],
+        "physiological_charge_drugbank": db_meta["physiological_charge_drugbank"],
         # Dimorphite-DL
         "protonation_state_method": dimorphite_result["protonation_state_method"],
         "dominant_state_pH": dimorphite_result["dominant_state_pH"],

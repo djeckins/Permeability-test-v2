@@ -217,6 +217,13 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         "pka_confidence",
         "pka_note",
         "lookup_match_name",
+        # ChEMBL metadata
+        "chembl_id",
+        "chembl_name",
+        "chembl_acd_pka",
+        # PubChem metadata
+        "pubchem_cid",
+        "pubchem_pka_values",
         # DrugBank metadata
         "drugbank_match_status",
         "drugbank_name",
