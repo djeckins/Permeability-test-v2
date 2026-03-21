@@ -1,0 +1,7 @@
+-e .
+streamlit
+pandas
+openpyxl
+rdkit
+requests
+beautifulsoup4
