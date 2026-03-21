@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-"""Ionization analysis with live DrugBank lookup and site-aware fallback.
+"""Ionization analysis: DrugBank lookup → site-aware pKa heuristic → Dimorphite-DL → pH-specific ionization → logD.
 
-Priority order for pKa / charge information:
-1. User-provided pKa values from input records
-2. Live lookup on public DrugBank search/detail pages
-3. Internal site-aware heuristic pKa assignment from SMARTS patterns
+Pipeline
+--------
+1. Canonicalize molecule (caller provides canonical SMILES).
+2. Try exact DrugBank lookup (name → InChIKey → canonical SMILES).
+3. If no reliable match → enhanced site-aware heuristic pKa predictor.
+4. Run Dimorphite-DL around user pH for protonation-state enumeration.
+5. Decide whether one representative pKa is chemically meaningful.
+6. Compute pH-specific ionization (fraction unionized, net charge).
+7. Compute pH-specific logD.
+8. Return full provenance metadata.
 
 Notes
 -----
-- pH is always passed explicitly by the caller.
-- Live DrugBank lookup is intentionally conservative: it queries DrugBank
-  by the molecule name first, then falls back to InChIKey / canonical SMILES.
-- If DrugBank does not return a usable match, the code falls back to the
-  internal site-aware heuristic rules.
+- pH is always passed explicitly by the caller; never hardcoded.
+- DrugBank matching is conservative: only exact or highly reliable matches are used.
+- For polyphenols / multiprotic molecules, pKa column is left blank.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Literal
+import logging
 import math
 import os
 import re
@@ -29,9 +34,14 @@ from bs4 import BeautifulSoup
 from rdkit import Chem
 from rdkit.Chem import inchi
 
+log = logging.getLogger(__name__)
+
 DEFAULT_PH: float = 5.5
 IonType = Literal["acid", "base"]
 
+# ---------------------------------------------------------------------------
+# DrugBank configuration
+# ---------------------------------------------------------------------------
 _DRUGBANK_SEARCH_URL = "https://go.drugbank.com/unearth/q?query={query}&searcher=drugs"
 _DRUGBANK_BASE_URL = "https://go.drugbank.com"
 _HTTP_TIMEOUT = float(os.getenv("EPIDERMAL_DRUGBANK_TIMEOUT", "8.0"))
@@ -39,13 +49,20 @@ _MAX_CANDIDATES = int(os.getenv("EPIDERMAL_DRUGBANK_MAX_CANDIDATES", "5"))
 _DISABLE_LIVE_LOOKUP = os.getenv("EPIDERMAL_DISABLE_DRUGBANK_LOOKUP", "0") == "1"
 _HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; EpidermalBarrierScreen/0.2; "
+        "Mozilla/5.0 (compatible; EpidermalBarrierScreen/0.3; "
         "+https://github.com/djeckins/Permeability-test)"
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Match quality thresholds for DrugBank
+_DRUGBANK_EXACT_THRESHOLD = 90   # score >= 90 → exact
+_DRUGBANK_ACCEPT_THRESHOLD = 60  # score >= 60 → accepted; < 60 → rejected
 
+
+# ---------------------------------------------------------------------------
+# Ionizable site dataclass
+# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class IonizableSite:
     name: str
@@ -55,7 +72,9 @@ class IonizableSite:
     source: str = "heuristic"
 
 
-# Typical site pKa values used only as rough fallbacks.
+# ---------------------------------------------------------------------------
+# SMARTS patterns for site-aware heuristic pKa prediction
+# ---------------------------------------------------------------------------
 _ACID_PATTERNS: list[tuple[str, str, float]] = [
     ("[CX3](=O)[OX2H1]", "carboxylic_acid", 4.2),
     ("[PX4](=O)([OX2H1])[OX2H1,OX1-]", "phosphate", 2.1),
@@ -77,6 +96,9 @@ _BASE_PATTERNS: list[tuple[str, str, float]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 def _safe_float(value: Any) -> float | None:
     if value in (None, "", "None", "nan"):
         return None
@@ -112,6 +134,9 @@ def _normalize_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+# ---------------------------------------------------------------------------
+# Compiled SMARTS patterns (cached)
+# ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def _compiled_patterns() -> list[tuple[Chem.Mol, str, IonType, float]]:
     compiled: list[tuple[Chem.Mol, str, IonType, float]] = []
@@ -126,6 +151,9 @@ def _compiled_patterns() -> list[tuple[Chem.Mol, str, IonType, float]]:
     return compiled
 
 
+# ---------------------------------------------------------------------------
+# Part 1 — DrugBank lookup
+# ---------------------------------------------------------------------------
 @lru_cache(maxsize=256)
 def _fetch_url(url: str) -> str | None:
     if _DISABLE_LIVE_LOOKUP:
@@ -252,8 +280,7 @@ def _live_drugbank_lookup_by_query(query: str) -> dict[str, Any] | None:
 
     if best is None:
         return None
-    # Be conservative: accept only reasonable matches.
-    if best_score < 60:
+    if best_score < _DRUGBANK_ACCEPT_THRESHOLD:
         return None
     return best
 
@@ -264,6 +291,7 @@ def _live_drugbank_lookup(
     name: str | None,
     inchikey: str | None,
 ) -> dict[str, Any] | None:
+    """Try DrugBank lookup with priority: name → InChIKey → canonical SMILES."""
     if _DISABLE_LIVE_LOOKUP:
         return None
 
@@ -282,38 +310,21 @@ def _live_drugbank_lookup(
     return None
 
 
-def _neutral_fraction_acid(pka: float, ph: float) -> float:
-    try:
-        ratio = 10 ** (ph - pka)
-        return 1.0 / (1.0 + ratio)
-    except OverflowError:
-        return 0.0
+def _drugbank_match_status(entry: dict[str, Any] | None) -> str:
+    """Classify DrugBank match quality."""
+    if entry is None:
+        return "no_match"
+    score = entry.get("score", 0)
+    if score >= _DRUGBANK_EXACT_THRESHOLD:
+        return "exact"
+    if score >= _DRUGBANK_ACCEPT_THRESHOLD:
+        return "uncertain"
+    return "no_match"
 
 
-def _neutral_fraction_base(pka: float, ph: float) -> float:
-    try:
-        ratio = 10 ** (pka - ph)
-        return 1.0 / (1.0 + ratio)
-    except OverflowError:
-        return 0.0
-
-
-def _mean_charge_acid(pka: float, ph: float) -> float:
-    try:
-        ratio = 10 ** (ph - pka)
-        return -ratio / (1.0 + ratio)
-    except OverflowError:
-        return -1.0
-
-
-def _mean_charge_base(pka: float, ph: float) -> float:
-    try:
-        ratio = 10 ** (pka - ph)
-        return ratio / (1.0 + ratio)
-    except OverflowError:
-        return 1.0
-
-
+# ---------------------------------------------------------------------------
+# Part 2 — Site-aware heuristic pKa prediction
+# ---------------------------------------------------------------------------
 def detect_ionizable_sites(mol: Chem.Mol) -> list[IonizableSite]:
     sites: list[IonizableSite] = []
     seen: set[tuple[str, tuple[int, ...]]] = set()
@@ -346,6 +357,164 @@ def classify_ionization(sites: list[IonizableSite]) -> str:
     return "base"
 
 
+def _count_phenol_sites(sites: list[IonizableSite]) -> int:
+    return sum(1 for s in sites if s.name == "phenol")
+
+
+def _has_carboxylic_acid(sites: list[IonizableSite]) -> bool:
+    return any(s.name == "carboxylic_acid" for s in sites)
+
+
+# ---------------------------------------------------------------------------
+# Part 3 — Single representative pKa decision
+# ---------------------------------------------------------------------------
+def _decide_representative_pka(
+    *,
+    acidic_pkas: list[float],
+    basic_pkas: list[float],
+    ion_class: str,
+    sites: list[IonizableSite],
+) -> tuple[float | None, str | None]:
+    """Decide whether a single representative pKa is chemically meaningful.
+
+    Returns
+    -------
+    (pka_value_or_None, pka_note_or_None)
+    """
+    if ion_class == "non_ionizable":
+        return None, None
+
+    n_acidic = len(acidic_pkas)
+    n_basic = len(basic_pkas)
+    n_phenol = _count_phenol_sites(sites)
+    has_cooh = _has_carboxylic_acid(sites)
+
+    # Case D — ampholyte: both acidic and basic sites
+    if n_acidic > 0 and n_basic > 0:
+        return None, "multiprotic_or_no_single_representative_pKa"
+
+    # Case D — multiple acidic sites
+    if n_acidic > 1:
+        # Special case: carboxylic acid + phenols → COOH dominates first ionization
+        if has_cooh and n_phenol >= 1 and n_acidic == (1 + n_phenol):
+            # The carboxylic acid is the strongest (lowest pKa); use it
+            cooh_pkas = [s.heuristic_pka for s in sites if s.name == "carboxylic_acid"]
+            if cooh_pkas:
+                return round(min(acidic_pkas), 2), None
+        # Polyphenol or multi-acidic: no single pKa
+        if n_phenol >= 2:
+            return None, "multiprotic_or_no_single_representative_pKa"
+        # Other multi-acidic: no single pKa
+        return None, "multiprotic_or_no_single_representative_pKa"
+
+    # Case D — multiple basic sites
+    if n_basic > 1:
+        return None, "multiprotic_or_no_single_representative_pKa"
+
+    # Case B — simple monoprotic acid
+    if n_acidic == 1 and n_basic == 0:
+        return round(acidic_pkas[0], 2), None
+
+    # Case C — simple monoprotic base
+    if n_basic == 1 and n_acidic == 0:
+        return round(basic_pkas[0], 2), None
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — Dimorphite-DL protonation states
+# ---------------------------------------------------------------------------
+def _run_dimorphite(canonical_smiles: str, ph: float) -> dict[str, Any]:
+    """Run Dimorphite-DL around user pH and extract dominant protonation info."""
+    result: dict[str, Any] = {
+        "protonation_state_method": None,
+        "dominant_state_pH": None,
+        "dominant_charge_class_pH": None,
+        "expected_net_charge_pH": None,
+        "dimorphite_states": None,
+    }
+
+    try:
+        from dimorphite_dl import protonate_smiles
+    except ImportError:
+        result["protonation_state_method"] = "dimorphite_unavailable"
+        return result
+
+    try:
+        states = protonate_smiles(
+            canonical_smiles,
+            ph_min=max(0.0, ph - 0.5),
+            ph_max=min(14.0, ph + 0.5),
+            precision=1.0,
+        )
+    except Exception as exc:
+        log.debug("Dimorphite-DL failed for %s: %s", canonical_smiles, exc)
+        result["protonation_state_method"] = "dimorphite_error"
+        return result
+
+    if not states:
+        result["protonation_state_method"] = "dimorphite_no_output"
+        return result
+
+    result["protonation_state_method"] = "dimorphite_dl"
+    result["dimorphite_states"] = states
+
+    # Parse charge from each state
+    charges: list[int] = []
+    for smi in states:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            charge = sum(atom.GetFormalCharge() for atom in mol.GetAtoms())
+            charges.append(charge)
+
+    if charges:
+        # Most common charge = dominant state
+        from collections import Counter
+        charge_counts = Counter(charges)
+        dominant_charge = charge_counts.most_common(1)[0][0]
+        result["dominant_state_pH"] = round(ph, 2)
+        result["expected_net_charge_pH"] = dominant_charge
+        result["dominant_charge_class_pH"] = _dominant_charge_class(float(dominant_charge))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# pH-specific ionization math
+# ---------------------------------------------------------------------------
+def _neutral_fraction_acid(pka: float, ph: float) -> float:
+    try:
+        ratio = 10 ** (ph - pka)
+        return 1.0 / (1.0 + ratio)
+    except OverflowError:
+        return 0.0
+
+
+def _neutral_fraction_base(pka: float, ph: float) -> float:
+    try:
+        ratio = 10 ** (pka - ph)
+        return 1.0 / (1.0 + ratio)
+    except OverflowError:
+        return 0.0
+
+
+def _mean_charge_acid(pka: float, ph: float) -> float:
+    try:
+        ratio = 10 ** (ph - pka)
+        return -ratio / (1.0 + ratio)
+    except OverflowError:
+        return -1.0
+
+
+def _mean_charge_base(pka: float, ph: float) -> float:
+    try:
+        ratio = 10 ** (pka - ph)
+        return ratio / (1.0 + ratio)
+    except OverflowError:
+        return 1.0
+
+
 def _dominant_charge_class(expected_net_charge: float | None) -> str | None:
     if expected_net_charge is None:
         return None
@@ -360,6 +529,9 @@ def _dominant_charge_class(expected_net_charge: float | None) -> str | None:
     return "<=-2"
 
 
+# ---------------------------------------------------------------------------
+# Part 1+2 — pKa source resolution (input → DrugBank → heuristic)
+# ---------------------------------------------------------------------------
 def _site_pka_lists_from_source(
     *,
     sites: list[IonizableSite],
@@ -369,13 +541,23 @@ def _site_pka_lists_from_source(
     input_pka: float | None = None,
     input_pka_acidic: float | None = None,
     input_pka_basic: float | None = None,
-) -> tuple[list[float], list[float], str, str | None, str | None]:
-    """Return acidic/basic pKa lists and metadata.
+) -> tuple[list[float], list[float], str, dict[str, Any]]:
+    """Return acidic/basic pKa lists, source tag, and DrugBank metadata.
 
     Returns
     -------
-    acidic_list, basic_list, pka_source, matched_entry_name, lookup_notes
+    acidic_list, basic_list, pka_source, drugbank_meta
     """
+    drugbank_meta: dict[str, Any] = {
+        "drugbank_match_status": "not_attempted",
+        "drugbank_name": None,
+        "drugbank_url": None,
+        "acidic_pka_drugbank": None,
+        "basic_pka_drugbank": None,
+        "physiological_charge_drugbank": None,
+    }
+
+    # Priority 0: user-provided pKa values from input file
     if input_pka_acidic is not None or input_pka_basic is not None:
         acidic = [input_pka_acidic] if input_pka_acidic is not None else []
         basic = [input_pka_basic] if input_pka_basic is not None else []
@@ -385,37 +567,95 @@ def _site_pka_lists_from_source(
                 basic = [input_pka]
             else:
                 acidic = [input_pka]
-        return acidic, basic, "input", name, None
+        return acidic, basic, "input", drugbank_meta
 
     if input_pka is not None:
         ion_class = classify_ionization(sites)
         if ion_class == "base":
-            return [], [input_pka], "input", name, None
-        return [input_pka], [], "input", name, None
+            return [], [input_pka], "input", drugbank_meta
+        return [input_pka], [], "input", drugbank_meta
 
+    # Priority 1: Live DrugBank lookup
     entry = _live_drugbank_lookup(
         canonical_smiles=canonical_smiles,
         name=name,
         inchikey=inchikey,
     )
-    if entry is not None:
-        acidic = _parse_pka_list(entry.get("acidic_pka_list"))
-        basic = _parse_pka_list(entry.get("basic_pka_list"))
-        acid_pka = _safe_float(entry.get("strongest_acidic_pka"))
-        base_pka = _safe_float(entry.get("strongest_basic_pka"))
-        if acid_pka is not None and not acidic:
-            acidic.append(acid_pka)
-        if base_pka is not None and not basic:
-            basic.append(base_pka)
-        note = entry.get("source_url")
-        if acidic or basic or _safe_float(entry.get("physiological_charge")) is not None:
-            return acidic, basic, "drugbank_live", entry.get("name") or name, note
 
+    match_status = _drugbank_match_status(entry)
+    drugbank_meta["drugbank_match_status"] = match_status
+
+    if entry is not None:
+        drugbank_meta["drugbank_name"] = entry.get("name")
+        drugbank_meta["drugbank_url"] = entry.get("source_url")
+        drugbank_meta["acidic_pka_drugbank"] = entry.get("strongest_acidic_pka")
+        drugbank_meta["basic_pka_drugbank"] = entry.get("strongest_basic_pka")
+        drugbank_meta["physiological_charge_drugbank"] = entry.get("physiological_charge")
+
+    if match_status == "exact":
+        # Use DrugBank pKa values
+        acidic: list[float] = []
+        basic: list[float] = []
+        acid_pka = _safe_float(entry.get("strongest_acidic_pka"))  # type: ignore[union-attr]
+        base_pka = _safe_float(entry.get("strongest_basic_pka"))  # type: ignore[union-attr]
+        if acid_pka is not None:
+            acidic.append(acid_pka)
+        if base_pka is not None:
+            basic.append(base_pka)
+        if acidic or basic:
+            return acidic, basic, "drugbank_live", drugbank_meta
+
+    # If DrugBank match is uncertain, do NOT use its pKa — fall through to heuristic
+    # but keep the metadata for provenance
+
+    # Priority 2: Site-aware heuristic pKa prediction
     acidic = [s.heuristic_pka for s in sites if s.ion_type == "acid"]
     basic = [s.heuristic_pka for s in sites if s.ion_type == "base"]
-    return acidic, basic, "heuristic_site_rules", name, None
+    return acidic, basic, "heuristic_site_rules", drugbank_meta
 
 
+# ---------------------------------------------------------------------------
+# Confidence assessment
+# ---------------------------------------------------------------------------
+def _assess_pka_confidence(
+    *,
+    pka_source: str,
+    ion_class: str,
+    n_acidic: int,
+    n_basic: int,
+    n_phenol: int,
+) -> str:
+    """Return a confidence label for the pKa prediction."""
+    if pka_source == "input":
+        return "high"
+    if pka_source == "drugbank_live":
+        return "high"
+
+    # Heuristic site rules
+    if ion_class == "non_ionizable":
+        return "high"
+
+    # Simple monoprotic → moderate confidence for heuristic
+    if (n_acidic == 1 and n_basic == 0) or (n_basic == 1 and n_acidic == 0):
+        if n_phenol == 0:
+            return "moderate"
+        # Single phenol is less reliable
+        return "low"
+
+    # Polyphenols
+    if n_phenol >= 2:
+        return "low"
+
+    # Multiprotic / complex
+    if n_acidic + n_basic > 2:
+        return "low"
+
+    return "moderate"
+
+
+# ---------------------------------------------------------------------------
+# Main analysis function
+# ---------------------------------------------------------------------------
 def analyze_ionization(
     *,
     mol: Chem.Mol,
@@ -428,7 +668,11 @@ def analyze_ionization(
     input_pka_basic: float | None = None,
     input_logd_7_4: float | None = None,
 ) -> dict[str, Any]:
-    """Analyze ionization and pH-corrected lipophilicity for one molecule."""
+    """Analyze ionization and pH-corrected lipophilicity for one molecule.
+
+    Implements the full pipeline:
+    DrugBank → heuristic pKa → Dimorphite-DL → ionization → logD
+    """
     try:
         inchikey = inchi.MolToInchiKey(mol)
     except Exception:
@@ -437,7 +681,8 @@ def analyze_ionization(
     sites = detect_ionizable_sites(mol)
     ion_class = classify_ionization(sites)
 
-    acidic_pkas, basic_pkas, pka_source, matched_name, lookup_notes = _site_pka_lists_from_source(
+    # --- pKa resolution ---
+    acidic_pkas, basic_pkas, pka_source, drugbank_meta = _site_pka_lists_from_source(
         sites=sites,
         canonical_smiles=canonical_smiles,
         name=name,
@@ -447,26 +692,57 @@ def analyze_ionization(
         input_pka_basic=input_pka_basic,
     )
 
-    ionizable_groups = [s.name for s in sites]
-    acidic_neutral = [_neutral_fraction_acid(pka, ph) for pka in acidic_pkas]
-    basic_neutral = [_neutral_fraction_base(pka, ph) for pka in basic_pkas]
+    n_phenol = _count_phenol_sites(sites)
+    pka_confidence = _assess_pka_confidence(
+        pka_source=pka_source,
+        ion_class=ion_class,
+        n_acidic=len(acidic_pkas),
+        n_basic=len(basic_pkas),
+        n_phenol=n_phenol,
+    )
 
-    if not acidic_pkas and not basic_pkas and ion_class == "non_ionizable":
-        fraction_unionized = 1.0
-        fraction_ionized = 0.0
-        expected_net_charge = 0.0
-        logd = clogp
+    # --- Dimorphite-DL protonation states ---
+    dimorphite_result = _run_dimorphite(canonical_smiles, ph)
+
+    # --- Representative pKa decision ---
+    predicted_pka, pka_note = _decide_representative_pka(
+        acidic_pkas=acidic_pkas,
+        basic_pkas=basic_pkas,
+        ion_class=ion_class,
+        sites=sites,
+    )
+
+    # Merge DrugBank pka_note
+    if drugbank_meta.get("drugbank_match_status") == "uncertain":
+        extra = "drugbank_match_uncertain_pKa_not_used"
+        pka_note = f"{pka_note}; {extra}" if pka_note else extra
+
+    # --- pH-specific ionization ---
+    ionization_status: str = "ok"
+
+    if ion_class == "non_ionizable":
+        fraction_unionized: float | None = 1.0
+        fraction_ionized: float | None = 0.0
+        expected_net_charge: float | None = 0.0
+        logd: float | None = clogp
         logd_method = "neutral_fallback_equals_cLogP"
-        predicted_pka = None
-        pka_note = None
-    else:
+    elif not acidic_pkas and not basic_pkas:
+        # Ionizable by site detection but no pKa values available
+        fraction_unionized = None
+        fraction_ionized = None
+        expected_net_charge = None
+        logd = None
+        logd_method = "unavailable_due_to_missing_pKa"
+        ionization_status = "uncertain"
+    elif pka_confidence == "low" and pka_source == "heuristic_site_rules":
+        # Low confidence heuristic pKa → compute but mark as uncertain
         unionized = 1.0
-        for fn in acidic_neutral:
-            unionized *= fn
-        for fn in basic_neutral:
-            unionized *= fn
-        fraction_unionized = max(0.0, min(1.0, unionized)) if (acidic_pkas or basic_pkas) else None
-        fraction_ionized = None if fraction_unionized is None else 1.0 - fraction_unionized
+        for pka in acidic_pkas:
+            unionized *= _neutral_fraction_acid(pka, ph)
+        for pka in basic_pkas:
+            unionized *= _neutral_fraction_base(pka, ph)
+        fraction_unionized = max(0.0, min(1.0, unionized))
+        fraction_ionized = 1.0 - fraction_unionized
 
         expected_net_charge = 0.0
         for pka in acidic_pkas:
@@ -474,51 +750,78 @@ def analyze_ionization(
         for pka in basic_pkas:
             expected_net_charge += _mean_charge_base(pka, ph)
 
-        if pka_source == "drugbank_live" and not acidic_pkas and not basic_pkas:
-            # kept for completeness; current parser fills strongest acidic/basic when available
-            live = _live_drugbank_lookup(canonical_smiles=canonical_smiles, name=name, inchikey=inchikey)
-            phys_charge = _safe_float(live.get("physiological_charge") if live else None)
-            expected_net_charge = phys_charge
-            fraction_unionized = None
-            fraction_ionized = None
-            logd = None
-            logd_method = "unavailable_due_to_missing_pKa"
-        else:
-            if fraction_unionized is None:
-                logd = None
-                logd_method = "unavailable_due_to_missing_pKa"
-            else:
-                logd = round(clogp + math.log10(max(fraction_unionized, 1e-12)), 4)
-                logd_method = "pKa_corrected"
+        # Still compute logD but mark as uncertain
+        logd = round(clogp + math.log10(max(fraction_unionized, 1e-12)), 4)
+        logd_method = "pKa_corrected_low_confidence"
+        ionization_status = "uncertain"
+    else:
+        # Normal computation with reasonable confidence
+        unionized = 1.0
+        for pka in acidic_pkas:
+            unionized *= _neutral_fraction_acid(pka, ph)
+        for pka in basic_pkas:
+            unionized *= _neutral_fraction_base(pka, ph)
+        fraction_unionized = max(0.0, min(1.0, unionized))
+        fraction_ionized = 1.0 - fraction_unionized
 
-        all_pkas = acidic_pkas + basic_pkas
-        predicted_pka = round(min(all_pkas, key=lambda x: abs(x - ph)), 2) if all_pkas else None
-        pka_note = lookup_notes
+        expected_net_charge = 0.0
+        for pka in acidic_pkas:
+            expected_net_charge += _mean_charge_acid(pka, ph)
+        for pka in basic_pkas:
+            expected_net_charge += _mean_charge_base(pka, ph)
 
+        logd = round(clogp + math.log10(max(fraction_unionized, 1e-12)), 4)
+        logd_method = "pKa_corrected"
+
+    # Override with experimental logD if pH matches
     if input_logd_7_4 is not None and abs(float(ph) - 7.4) <= 0.15:
         logd = round(float(input_logd_7_4), 4)
         logd_method = "input_experimental_logD_7_4"
 
+    # --- Round final values ---
     expected_net_charge = None if expected_net_charge is None else round(float(expected_net_charge), 4)
     fraction_unionized = None if fraction_unionized is None else round(float(fraction_unionized), 4)
     fraction_ionized = None if fraction_ionized is None else round(float(fraction_ionized), 4)
     dominant_charge_class = _dominant_charge_class(expected_net_charge)
 
-    return {
+    # --- Build result ---
+    ionizable_groups = [s.name for s in sites]
+
+    result: dict[str, Any] = {
         "inchikey": inchikey,
         "ionization_class": ion_class,
         "ionizable_group_count": len(ionizable_groups),
         "ionizable_groups": "; ".join(ionizable_groups) if ionizable_groups else None,
+        # pKa columns
+        "predicted_pka": predicted_pka,
         "acidic_pka_list": "; ".join(f"{v:.2f}" for v in acidic_pkas) if acidic_pkas else None,
         "basic_pka_list": "; ".join(f"{v:.2f}" for v in basic_pkas) if basic_pkas else None,
-        "predicted_pka": predicted_pka,
         "pka_source": pka_source,
-        "lookup_match_name": matched_name,
+        "pka_prediction_method": pka_source,
+        "pka_confidence": pka_confidence,
         "pka_note": pka_note,
+        "lookup_match_name": drugbank_meta.get("drugbank_name") or name,
+        # DrugBank metadata
+        "drugbank_match_status": drugbank_meta["drugbank_match_status"],
+        "drugbank_name": drugbank_meta["drugbank_name"],
+        "drugbank_url": drugbank_meta["drugbank_url"],
+        "acidic_pka_drugbank": drugbank_meta["acidic_pka_drugbank"],
+        "basic_pka_drugbank": drugbank_meta["basic_pka_drugbank"],
+        "physiological_charge_drugbank": drugbank_meta["physiological_charge_drugbank"],
+        # Dimorphite-DL
+        "protonation_state_method": dimorphite_result["protonation_state_method"],
+        "dominant_state_pH": dimorphite_result["dominant_state_pH"],
+        "dominant_charge_class_pH": dimorphite_result["dominant_charge_class_pH"],
+        "expected_net_charge_pH": dimorphite_result["expected_net_charge_pH"],
+        # Ionization
         "fraction_unionized": fraction_unionized,
         "fraction_ionized": fraction_ionized,
         "expected_net_charge": expected_net_charge,
         "dominant_charge_class": dominant_charge_class,
+        "ionization_status": ionization_status,
+        # LogD
         "logd": logd,
         "logd_method": logd_method,
     }
+
+    return result

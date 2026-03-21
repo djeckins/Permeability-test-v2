@@ -91,7 +91,17 @@ def _charge_status_from_expected(expected_net_charge: float | None, fallback_for
     return "poor"
 
 
-def _ionization_status(fraction_unionized: float | None) -> str:
+def _ionization_status_criterion(
+    fraction_unionized: float | None,
+    ionization_status_flag: str,
+) -> str:
+    """Derive the per-criterion ionization status.
+
+    If ionization_status from the pipeline is 'uncertain', treat it as
+    suboptimal (not fully optimal, but not outright poor either).
+    """
+    if ionization_status_flag == "uncertain":
+        return "suboptimal"
     if fraction_unionized is None:
         return "poor"
     if fraction_unionized >= 0.8:
@@ -133,7 +143,7 @@ _STATUS_COLUMNS = [
     "rotb_status",
     "hac_status",
     "formal_charge_status",
-    "ionization_status",
+    "ionization_status_criterion",
 ]
 
 
@@ -180,7 +190,10 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         row["formal_charge_status"] = _charge_status_from_expected(
             row.get("expected_net_charge"), desc["formal_charge"]
         )
-        row["ionization_status"] = _ionization_status(row.get("fraction_unionized"))
+        row["ionization_status_criterion"] = _ionization_status_criterion(
+            row.get("fraction_unionized"),
+            row.get("ionization_status", "ok"),
+        )
 
         statuses = [row[c] for c in _STATUS_COLUMNS]
         row["final_result"] = _final_result(statuses)
@@ -195,24 +208,44 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         "hbd",
         "rotb",
         "hac",
+        # pKa columns
         "predicted_pka",
         "acidic_pka_list",
         "basic_pka_list",
         "pka_source",
-        "lookup_match_name",
+        "pka_prediction_method",
+        "pka_confidence",
         "pka_note",
+        "lookup_match_name",
+        # DrugBank metadata
+        "drugbank_match_status",
+        "drugbank_name",
+        "drugbank_url",
+        "acidic_pka_drugbank",
+        "basic_pka_drugbank",
+        "physiological_charge_drugbank",
+        # Ionization classification
         "ionization_class",
         "ionizable_group_count",
         "ionizable_groups",
         "inchikey",
+        # Lipophilicity
         "clogp",
         "logd",
         "logd_method",
         "tpsa",
+        # pH-specific ionization
         "fraction_unionized",
         "fraction_ionized",
         "expected_net_charge",
         "dominant_charge_class",
+        "ionization_status",
+        # Dimorphite-DL
+        "protonation_state_method",
+        "dominant_state_pH",
+        "dominant_charge_class_pH",
+        "expected_net_charge_pH",
+        # Formal charge & criteria statuses
         "formal_charge",
         "mw_status",
         "logd_status",
@@ -222,7 +255,7 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         "rotb_status",
         "hac_status",
         "formal_charge_status",
-        "ionization_status",
+        "ionization_status_criterion",
         "final_result",
         "input_smiles",
         "canonical_smiles",
