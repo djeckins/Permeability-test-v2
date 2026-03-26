@@ -1063,6 +1063,11 @@ def _site_pka_lists_from_source(
 # ---------------------------------------------------------------------------
 # Confidence assessment
 # ---------------------------------------------------------------------------
+def _has_carboxylic_acid_from_counts(n_acidic: int, n_phenol: int) -> bool:
+    """True when acidic sites include at least one non-phenol (likely COOH)."""
+    return n_acidic > n_phenol
+
+
 def _assess_pka_confidence(
     *,
     pka_source: str,
@@ -1094,12 +1099,17 @@ def _assess_pka_confidence(
         # Single phenol is less reliable
         return "low"
 
-    # Polyphenols
+    # Polyphenols — but COOH + phenols is a known pattern where COOH dominates
     if n_phenol >= 2:
+        if _has_carboxylic_acid_from_counts(n_acidic, n_phenol):
+            # COOH pKa is well-established; phenols are weaker — moderate
+            return "moderate"
         return "low"
 
     # Multiprotic / complex
     if n_acidic + n_basic > 2:
+        if _has_carboxylic_acid_from_counts(n_acidic, n_phenol):
+            return "moderate"
         return "low"
 
     return "moderate"
