@@ -8,7 +8,7 @@ from epidermal_barrier_screen.screen import screen_records
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Epidermal barrier screening CLI")
+    parser = argparse.ArgumentParser(description="Permeability screening CLI")
     parser.add_argument("--mode", required=True, choices=["smiles", "smiles_list", "sdf", "sdf_zip"])
     parser.add_argument("--input", required=True, help="SMILES string for smiles mode, file path otherwise")
     parser.add_argument("--output-prefix", required=True, help="Output path prefix without extension")

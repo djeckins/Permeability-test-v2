@@ -14,7 +14,7 @@ from epidermal_barrier_screen.screen import screen_records
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Epidermal Barrier Screen",
+    page_title="Permeability Screen",
     page_icon="🧪",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -459,8 +459,8 @@ st.markdown(
     <div class="eb-hero">
       <div class="eb-hero-art">{_HERO_SVG}</div>
       <div class="eb-hero-content">
-        <h1>Epidermal Barrier Screening Tool</h1>
-        <p>Evaluate compounds for epidermal barrier permeation potential.<br>
+        <h1>Permeability Screening Tool</h1>
+        <p>Evaluate compounds for membrane permeation potential.<br>
            Supports single SMILES, SMILES lists, SDF files, and ZIP archives.</p>
       </div>
     </div>
@@ -626,7 +626,7 @@ if run:
         st.download_button(
             label="⬇️  Download Results (Excel)",
             data=xlsx_bytes,
-            file_name="epidermal_barrier_results.xlsx",
+            file_name="permeability_screening_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )

@@ -57,7 +57,7 @@ if os.getenv("EPIDERMAL_DISABLE_DRUGBANK_LOOKUP", "0") == "1":
 
 _HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; EpidermalBarrierScreen/0.3; "
+        "Mozilla/5.0 (compatible; PermeabilityScreen/0.3; "
         "+https://github.com/djeckins/Permeability-test)"
     ),
     "Accept-Language": "en-US,en;q=0.9",

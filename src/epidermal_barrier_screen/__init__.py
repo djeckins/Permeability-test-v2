@@ -1,1 +1,1 @@
-"""Epidermal barrier screening package."""
+"""Permeability screening package."""

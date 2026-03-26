@@ -1,6 +1,7 @@
-"""Screen molecule records against epidermal barrier passage criteria."""
+"""Screen molecule records against permeability passage criteria."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -24,7 +25,7 @@ def _mw_status(v: float) -> str:
 
 
 def _logd_status(v: float | None) -> str:
-    if v is None:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
         return "poor"
     if 1.0 <= v <= 3.0:
         return "optimal"
@@ -74,7 +75,7 @@ def _hac_status(v: int) -> str:
 
 
 def _charge_status_from_expected(expected_net_charge: float | None, fallback_formal_charge: int) -> str:
-    if expected_net_charge is None:
+    if expected_net_charge is None or (isinstance(expected_net_charge, float) and math.isnan(expected_net_charge)):
         v = fallback_formal_charge
     else:
         abs_q = abs(expected_net_charge)
@@ -102,7 +103,7 @@ def _ionization_status_criterion(
     """
     if ionization_status_flag == "uncertain":
         return "suboptimal"
-    if fraction_unionized is None:
+    if fraction_unionized is None or (isinstance(fraction_unionized, float) and math.isnan(fraction_unionized)):
         return "poor"
     if fraction_unionized >= 0.8:
         return "optimal"

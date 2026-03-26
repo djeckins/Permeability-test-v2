@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "epidermal-barrier-screen"
 version = "0.2.0"
-description = "Screen molecules against epidermal barrier passage criteria"
+description = "Screen molecules against permeability passage criteria"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
