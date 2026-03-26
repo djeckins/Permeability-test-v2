@@ -14,7 +14,7 @@ from epidermal_barrier_screen.screen import screen_records
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Epidermal Barrier Screen",
+    page_title="Permeability Screen",
     page_icon="🧪",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -253,7 +253,7 @@ st.markdown(
 _STATUS_COLS = [
     "mw_status", "logd_status", "tpsa_status", "hbd_status",
     "hba_status", "rotb_status", "hac_status", "formal_charge_status",
-    "ionization_status",
+    "ionization_status_criterion",
 ]
 
 # Numeric column → its status column (for direct cell colouring)
@@ -265,10 +265,10 @@ _NUMERIC_STATUS = {
     "rotb":                  "rotb_status",
     "hac":                   "hac_status",
     "expected_net_charge":   "formal_charge_status",
-    "fraction_unionized":    "ionization_status",
+    "fraction_unionized":    "ionization_status_criterion",
 }
 
-# Columns shown in the Streamlit table
+# Main visible columns in the Streamlit table
 _DISPLAY_COLS = [
     "name",
     "mw",
@@ -277,16 +277,9 @@ _DISPLAY_COLS = [
     "rotb",
     "hac",
     "predicted_pka",
-    "acidic_pka_list",
-    "basic_pka_list",
-    "pka_source",
-    "ionization_class",
     "clogp",
     "logd",
-    "logd_method",
     "fraction_unionized",
-    "expected_net_charge",
-    "formal_charge",
     "final_result",
 ]
 
@@ -466,8 +459,8 @@ st.markdown(
     <div class="eb-hero">
       <div class="eb-hero-art">{_HERO_SVG}</div>
       <div class="eb-hero-content">
-        <h1>Epidermal Barrier Screening Tool</h1>
-        <p>Evaluate compounds for epidermal barrier permeation potential.<br>
+        <h1>Permeability Screening Tool</h1>
+        <p>Evaluate compounds for membrane permeation potential.<br>
            Supports single SMILES, SMILES lists, SDF files, and ZIP archives.</p>
       </div>
     </div>
@@ -615,19 +608,12 @@ if run:
             "hbd": st.column_config.NumberColumn("HBD"),
             "rotb": st.column_config.NumberColumn("RB"),
             "hac": st.column_config.NumberColumn("HAC"),
-            "predicted_pka": st.column_config.NumberColumn("Representative pKa"),
-            "acidic_pka_list": st.column_config.TextColumn("Acidic pKa list", width="small"),
-            "basic_pka_list": st.column_config.TextColumn("Basic pKa list", width="small"),
-            "pka_source": st.column_config.TextColumn("pKa Source", width="small"),
-            "ionization_class": st.column_config.TextColumn("Ionization"),
+            "predicted_pka": st.column_config.NumberColumn("pKa"),
             "clogp": st.column_config.NumberColumn("cLogP"),
             "logd": st.column_config.NumberColumn(f"LogD (pH {ph_input:.1f})"),
-            "logd_method": st.column_config.TextColumn("LogD Method", width="small"),
             "fraction_unionized": st.column_config.NumberColumn(
-                f"Fraction Unionized (pH {ph_input:.1f})"
+                f"f_unionized (pH {ph_input:.1f})"
             ),
-            "expected_net_charge": st.column_config.NumberColumn(f"Expected Net Charge (pH {ph_input:.1f})"),
-            "formal_charge": st.column_config.NumberColumn("Formal Charge"),
             "final_result": st.column_config.TextColumn("Final Result"),
         },
     )
@@ -640,7 +626,7 @@ if run:
         st.download_button(
             label="⬇️  Download Results (Excel)",
             data=xlsx_bytes,
-            file_name="epidermal_barrier_results.xlsx",
+            file_name="permeability_screening_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -670,10 +656,19 @@ with st.expander("📋  Screening criteria reference"):
         | **Charge at pH {current_ph:.1f}** | neutral / near-neutral | about ±1 | multi-charged |
         | **Ionization (pH {current_ph:.1f})** | f_unionized ≥ 0.8 | 0.5–0.8 | < 0.5 |
 
-        pKa priority order in this build:
+        pKa pipeline in this build:
         1. `input_pka_acidic` / `input_pka_basic` / `input_pka` from the file
-        2. live **DrugBank** lookup by compound name (public page parsing)
-        3. internal **site-aware heuristic fallback**
+        2. **ChEMBL** API lookup (molecule properties, InChIKey / SMILES / name)
+        3. **PubChem** PUG-View lookup (Dissociation Constants annotations)
+        4. **DrugBank** web lookup by compound name (public page parsing)
+        5. **QupKake** ML-based site-aware pKa predictor (if installed)
+        6. **site-aware heuristic** pKa predictor (SMARTS-based fallback)
+        7. **Dimorphite-DL** protonation state enumeration at the selected pH
+        8. pH-specific ionization and logD calculation
+
+        The main pKa column shows a single value only when chemically meaningful
+        (simple monoprotic acid/base). For multiprotic, ampholytic, or polyphenolic
+        molecules the pKa column is left blank — detailed pKa data is in the export.
 
         `logD_7_4` from the input file is only used as an override when the selected pH is ~7.4.
         Otherwise the app reports a pH-corrected estimate derived from the selected pH.

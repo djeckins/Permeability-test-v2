@@ -1,6 +1,7 @@
-"""Screen molecule records against epidermal barrier passage criteria."""
+"""Screen molecule records against permeability passage criteria."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -24,7 +25,7 @@ def _mw_status(v: float) -> str:
 
 
 def _logd_status(v: float | None) -> str:
-    if v is None:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
         return "poor"
     if 1.0 <= v <= 3.0:
         return "optimal"
@@ -74,7 +75,7 @@ def _hac_status(v: int) -> str:
 
 
 def _charge_status_from_expected(expected_net_charge: float | None, fallback_formal_charge: int) -> str:
-    if expected_net_charge is None:
+    if expected_net_charge is None or (isinstance(expected_net_charge, float) and math.isnan(expected_net_charge)):
         v = fallback_formal_charge
     else:
         abs_q = abs(expected_net_charge)
@@ -91,8 +92,18 @@ def _charge_status_from_expected(expected_net_charge: float | None, fallback_for
     return "poor"
 
 
-def _ionization_status(fraction_unionized: float | None) -> str:
-    if fraction_unionized is None:
+def _ionization_status_criterion(
+    fraction_unionized: float | None,
+    ionization_status_flag: str,
+) -> str:
+    """Derive the per-criterion ionization status.
+
+    If ionization_status from the pipeline is 'uncertain', treat it as
+    suboptimal (not fully optimal, but not outright poor either).
+    """
+    if ionization_status_flag == "uncertain":
+        return "suboptimal"
+    if fraction_unionized is None or (isinstance(fraction_unionized, float) and math.isnan(fraction_unionized)):
         return "poor"
     if fraction_unionized >= 0.8:
         return "optimal"
@@ -133,7 +144,7 @@ _STATUS_COLUMNS = [
     "rotb_status",
     "hac_status",
     "formal_charge_status",
-    "ionization_status",
+    "ionization_status_criterion",
 ]
 
 
@@ -180,7 +191,10 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         row["formal_charge_status"] = _charge_status_from_expected(
             row.get("expected_net_charge"), desc["formal_charge"]
         )
-        row["ionization_status"] = _ionization_status(row.get("fraction_unionized"))
+        row["ionization_status_criterion"] = _ionization_status_criterion(
+            row.get("fraction_unionized"),
+            row.get("ionization_status", "ok"),
+        )
 
         statuses = [row[c] for c in _STATUS_COLUMNS]
         row["final_result"] = _final_result(statuses)
@@ -195,24 +209,51 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         "hbd",
         "rotb",
         "hac",
+        # pKa columns
         "predicted_pka",
         "acidic_pka_list",
         "basic_pka_list",
         "pka_source",
-        "lookup_match_name",
+        "pka_prediction_method",
+        "pka_confidence",
         "pka_note",
+        "lookup_match_name",
+        # ChEMBL metadata
+        "chembl_id",
+        "chembl_name",
+        "chembl_acd_pka",
+        # PubChem metadata
+        "pubchem_cid",
+        "pubchem_pka_values",
+        # DrugBank metadata
+        "drugbank_match_status",
+        "drugbank_name",
+        "drugbank_url",
+        "acidic_pka_drugbank",
+        "basic_pka_drugbank",
+        "physiological_charge_drugbank",
+        # Ionization classification
         "ionization_class",
         "ionizable_group_count",
         "ionizable_groups",
         "inchikey",
+        # Lipophilicity
         "clogp",
         "logd",
         "logd_method",
         "tpsa",
+        # pH-specific ionization
         "fraction_unionized",
         "fraction_ionized",
         "expected_net_charge",
         "dominant_charge_class",
+        "ionization_status",
+        # Dimorphite-DL
+        "protonation_state_method",
+        "dominant_state_pH",
+        "dominant_charge_class_pH",
+        "expected_net_charge_pH",
+        # Formal charge & criteria statuses
         "formal_charge",
         "mw_status",
         "logd_status",
@@ -222,7 +263,7 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         "rotb_status",
         "hac_status",
         "formal_charge_status",
-        "ionization_status",
+        "ionization_status_criterion",
         "final_result",
         "input_smiles",
         "canonical_smiles",
