@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Ionization analysis: ChEMBL/PubChem → DrugBank → heuristic → Dimorphite-DL → ionization → logD.
+"""Ionization analysis: ChEMBL/PubChem → DrugBank → QupKake → heuristic → Dimorphite-DL → ionization → logD.
 
 Pipeline
 --------
@@ -8,19 +8,22 @@ Pipeline
 2. Try ChEMBL API lookup (by InChIKey / canonical SMILES / name).
 3. If no ChEMBL match → try PubChem PUG-View (Dissociation Constants).
 4. If no PubChem match → try DrugBank web lookup.
-5. If no DrugBank match → site-aware heuristic pKa predictor.
-6. Run Dimorphite-DL around user pH for protonation-state enumeration.
-7. Decide whether one representative pKa is chemically meaningful.
-8. Compute pH-specific ionization (fraction unionized, net charge).
-9. Compute pH-specific logD.
-10. Return full provenance metadata.
+5. If no DrugBank match → try QupKake ML-based site-aware pKa predictor.
+6. If QupKake unavailable → site-aware heuristic pKa predictor (SMARTS fallback).
+7. Run Dimorphite-DL around user pH for protonation-state enumeration.
+8. Decide whether one representative pKa is chemically meaningful.
+9. Compute pH-specific ionization (fraction unionized, net charge).
+10. Compute pH-specific logD.
+11. Return full provenance metadata.
 
 Notes
 -----
 - pH is always passed explicitly by the caller; never hardcoded.
 - ChEMBL and PubChem are queried first as structured database APIs.
 - DrugBank matching is conservative: only exact or highly reliable matches are used.
+- QupKake provides site-level micro-pKa predictions (acidic & basic).
 - For polyphenols / multiprotic molecules, pKa column is left blank.
+- When pKa is uncertain, ionization and logD are left blank rather than faked.
 """
 
 from dataclasses import dataclass, field
@@ -447,6 +450,85 @@ def _pubchem_lookup(
 
 
 # ---------------------------------------------------------------------------
+# QupKake ML pKa predictor (optional)
+# ---------------------------------------------------------------------------
+_DISABLE_QUPKAKE = os.getenv("EPIDERMAL_DISABLE_QUPKAKE", "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def _qupkake_available() -> bool:
+    """Check whether QupKake is importable."""
+    if _DISABLE_QUPKAKE:
+        return False
+    try:
+        import qupkake  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@lru_cache(maxsize=256)
+def _qupkake_predict(canonical_smiles: str) -> dict[str, Any] | None:
+    """Run QupKake on a SMILES and return site-level acidic/basic pKa lists.
+
+    QupKake returns micro-pKa values for each ionizable site (atom-level).
+    We collect them into acidic and basic lists.
+    """
+    if not _qupkake_available():
+        return None
+
+    try:
+        from qupkake import Predictor
+
+        predictor = Predictor()
+        results = predictor.predict(canonical_smiles)
+
+        if results is None or not hasattr(results, "__iter__"):
+            return None
+
+        acidic_pkas: list[float] = []
+        basic_pkas: list[float] = []
+
+        # QupKake returns per-site predictions; iterate and collect
+        for site in results:
+            pka_val = None
+            site_type = None
+
+            if isinstance(site, dict):
+                pka_val = _safe_float(site.get("pka") or site.get("pKa"))
+                site_type = site.get("type", "").lower()
+            elif hasattr(site, "pka"):
+                pka_val = _safe_float(getattr(site, "pka", None))
+                site_type = getattr(site, "type", "").lower()
+
+            if pka_val is None:
+                continue
+
+            if site_type in ("acid", "acidic", "deprotonation"):
+                acidic_pkas.append(pka_val)
+            elif site_type in ("base", "basic", "protonation"):
+                basic_pkas.append(pka_val)
+            else:
+                # Heuristic: pKa < 7 → likely acidic, >= 7 → likely basic
+                if pka_val < 7.0:
+                    acidic_pkas.append(pka_val)
+                else:
+                    basic_pkas.append(pka_val)
+
+        if not acidic_pkas and not basic_pkas:
+            return None
+
+        return {
+            "acidic_pkas": sorted(acidic_pkas),
+            "basic_pkas": sorted(basic_pkas, reverse=True),
+            "method": "qupkake",
+        }
+    except Exception as exc:
+        log.debug("QupKake failed for %s: %s", canonical_smiles, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # DrugBank web-scraping lookup
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=256)
@@ -825,7 +907,7 @@ def _dominant_charge_class(expected_net_charge: float | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# pKa source resolution: input → ChEMBL → PubChem → DrugBank → heuristic
+# pKa source resolution: input → ChEMBL → PubChem → DrugBank → QupKake → heuristic
 # ---------------------------------------------------------------------------
 def _site_pka_lists_from_source(
     *,
@@ -839,7 +921,7 @@ def _site_pka_lists_from_source(
 ) -> tuple[list[float], list[float], str, dict[str, Any]]:
     """Return acidic/basic pKa lists, source tag, and database metadata.
 
-    Cascade: input → ChEMBL → PubChem → DrugBank → heuristic.
+    Cascade: input → ChEMBL → PubChem → DrugBank → QupKake → heuristic.
 
     Returns
     -------
@@ -961,7 +1043,18 @@ def _site_pka_lists_from_source(
     # If DrugBank match is uncertain, do NOT use its pKa — fall through
     # but keep the metadata for provenance
 
-    # ── Priority 4: Site-aware heuristic pKa prediction ──
+    # ── Priority 4: QupKake ML-based site-aware predictor ──
+    if canonical_smiles:
+        qupkake_result = _qupkake_predict(canonical_smiles)
+        if qupkake_result is not None:
+            return (
+                qupkake_result["acidic_pkas"],
+                qupkake_result["basic_pkas"],
+                "qupkake",
+                db_meta,
+            )
+
+    # ── Priority 5: SMARTS-based heuristic pKa prediction (fallback) ──
     acidic = [s.heuristic_pka for s in sites if s.ion_type == "acid"]
     basic = [s.heuristic_pka for s in sites if s.ion_type == "base"]
     return acidic, basic, "heuristic_site_rules", db_meta
@@ -987,8 +1080,10 @@ def _assess_pka_confidence(
         return "high"
     if pka_source == "chembl":
         return "moderate"  # ChemAxon predicted values
+    if pka_source == "qupkake":
+        return "moderate"  # ML-predicted, better than heuristic
 
-    # Heuristic site rules
+    # Heuristic site rules or non-ionizable
     if ion_class == "non_ionizable":
         return "high"
 
@@ -1028,7 +1123,7 @@ def analyze_ionization(
     """Analyze ionization and pH-corrected lipophilicity for one molecule.
 
     Implements the full pipeline:
-    ChEMBL → PubChem → DrugBank → heuristic pKa → Dimorphite-DL → ionization → logD
+    ChEMBL → PubChem → DrugBank → QupKake → heuristic pKa → Dimorphite-DL → ionization → logD
     """
     try:
         inchikey = inchi.MolToInchiKey(mol)
@@ -1092,24 +1187,13 @@ def analyze_ionization(
         logd_method = "unavailable_due_to_missing_pKa"
         ionization_status = "uncertain"
     elif pka_confidence == "low" and pka_source == "heuristic_site_rules":
-        # Low confidence heuristic pKa → compute but mark as uncertain
-        unionized = 1.0
-        for pka in acidic_pkas:
-            unionized *= _neutral_fraction_acid(pka, ph)
-        for pka in basic_pkas:
-            unionized *= _neutral_fraction_base(pka, ph)
-        fraction_unionized = max(0.0, min(1.0, unionized))
-        fraction_ionized = 1.0 - fraction_unionized
-
-        expected_net_charge = 0.0
-        for pka in acidic_pkas:
-            expected_net_charge += _mean_charge_acid(pka, ph)
-        for pka in basic_pkas:
-            expected_net_charge += _mean_charge_base(pka, ph)
-
-        # Still compute logD but mark as uncertain
-        logd = round(clogp + math.log10(max(fraction_unionized, 1e-12)), 4)
-        logd_method = "pKa_corrected_low_confidence"
+        # Low confidence heuristic pKa → do NOT fake ionization or logD
+        # Per spec: when pKa is uncertain, leave ionization and logD blank
+        fraction_unionized = None
+        fraction_ionized = None
+        expected_net_charge = None
+        logd = None
+        logd_method = "unavailable_due_to_uncertain_ionization"
         ionization_status = "uncertain"
     else:
         # Normal computation with reasonable confidence
