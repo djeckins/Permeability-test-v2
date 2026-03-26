@@ -1,6 +1,7 @@
 """Screen molecule records against permeability passage criteria."""
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -8,6 +9,12 @@ import pandas as pd
 
 from epidermal_barrier_screen.descriptors import calculate
 from epidermal_barrier_screen.ionization import DEFAULT_PH, analyze_ionization
+from epidermal_barrier_screen.services.pka_pipeline import (
+    collect_pka_entries,
+    build_pka_detail_rows,
+)
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +155,31 @@ _STATUS_COLUMNS = [
 ]
 
 
-def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.DataFrame:
+def screen_records(
+    records: list[dict[str, Any]],
+    ph: float = DEFAULT_PH,
+) -> pd.DataFrame:
+    """Screen molecules and return a DataFrame with all columns.
+
+    Also builds an exploded per-pKa DataFrame accessible via
+    ``screen_records_with_pka_details()``.
+    """
     rows = []
+    pka_detail_rows: list[dict[str, Any]] = []
+
     for rec in records:
         row: dict[str, Any] = {
             "name": rec.get("name"),
             "input_smiles": rec.get("input_smiles"),
             "canonical_smiles": rec.get("canonical_smiles"),
             "parse_status": rec.get("parse_status", "invalid"),
+            # Resolution provenance
+            "input_name": rec.get("input_name"),
+            "input_type": rec.get("input_type", "smiles"),
+            "matched_name": rec.get("matched_name"),
+            "resolution_source": rec.get("resolution_source"),
+            "resolution_confidence": rec.get("resolution_confidence"),
+            "resolution_notes": rec.get("resolution_notes"),
         }
 
         if rec.get("parse_status") != "ok" or rec.get("mol") is None:
@@ -199,6 +223,22 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         statuses = [row[c] for c in _STATUS_COLUMNS]
         row["final_result"] = _final_result(statuses)
         rows.append(row)
+
+        # Build per-pKa detail rows
+        try:
+            entries = collect_pka_entries(ion)
+            if entries:
+                identity = {
+                    "name": rec.get("name"),
+                    "canonical_smiles": rec.get("canonical_smiles"),
+                    "inchikey": ion.get("inchikey"),
+                }
+                detail_rows = build_pka_detail_rows(
+                    entries, float(ph), desc["clogp"], identity
+                )
+                pka_detail_rows.extend(detail_rows)
+        except Exception as exc:
+            log.debug("Failed to build pKa detail rows: %s", exc)
 
     col_order = [
         "name",
@@ -267,10 +307,49 @@ def screen_records(records: list[dict[str, Any]], ph: float = DEFAULT_PH) -> pd.
         "final_result",
         "input_smiles",
         "canonical_smiles",
+        # --- New provenance / extended fields ---
+        "input_name",
+        "input_type",
+        "matched_name",
+        "resolution_source",
+        "resolution_confidence",
+        "resolution_notes",
+        "logp_value",
+        "logp_source",
+        "logp_evidence_type",
+        "pka_values",
+        "used_qupkake_fallback",
+        "warnings",
     ]
 
     df = pd.DataFrame(rows)
     for col in col_order:
         if col not in df.columns:
             df[col] = None
-    return df[col_order]
+    # Keep any extra columns that might exist but aren't in col_order
+    extra_cols = [c for c in df.columns if c not in col_order]
+    final_cols = col_order + extra_cols
+    df = df.reindex(columns=final_cols)
+
+    # Store per-pKa detail as a module-level cache for the caller
+    _store_pka_details(pka_detail_rows)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Per-pKa detail table (exploded, one row per pKa)
+# ---------------------------------------------------------------------------
+_last_pka_details: list[dict[str, Any]] = []
+
+
+def _store_pka_details(rows: list[dict[str, Any]]) -> None:
+    global _last_pka_details
+    _last_pka_details = rows
+
+
+def get_pka_detail_table() -> pd.DataFrame:
+    """Return the exploded per-pKa table from the last screen_records() call."""
+    if not _last_pka_details:
+        return pd.DataFrame()
+    return pd.DataFrame(_last_pka_details)
