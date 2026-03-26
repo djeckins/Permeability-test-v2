@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-"""Ionization analysis: ChEMBL/PubChem → DrugBank → QupKake → heuristic → Dimorphite-DL → ionization → logD.
+"""Ionization analysis: ChEMBL → DrugBank → PubChem → QupKake → Dimorphite-DL → ionization → logD.
 
 Pipeline
 --------
 1. Canonicalize molecule (caller provides canonical SMILES).
 2. Try ChEMBL API lookup (by InChIKey / canonical SMILES / name).
-3. If no ChEMBL match → try PubChem PUG-View (Dissociation Constants).
-4. If no PubChem match → try DrugBank web lookup.
-5. If no DrugBank match → try QupKake ML-based site-aware pKa predictor.
-6. If QupKake unavailable → site-aware heuristic pKa predictor (SMARTS fallback).
+3. If no ChEMBL match → try DrugBank web lookup.
+4. If no DrugBank match → try PubChem PUG-View (Dissociation Constants).
+5. If no PubChem match → try QupKake ML-based site-aware pKa predictor.
+6. If no pKa found anywhere → leave pKa / ionization / logD blank.
 7. Run Dimorphite-DL around user pH for protonation-state enumeration.
 8. Decide whether one representative pKa is chemically meaningful.
 9. Compute pH-specific ionization (fraction unionized, net charge).
@@ -19,11 +19,12 @@ Pipeline
 Notes
 -----
 - pH is always passed explicitly by the caller; never hardcoded.
-- ChEMBL and PubChem are queried first as structured database APIs.
-- DrugBank matching is conservative: only exact or highly reliable matches are used.
-- QupKake provides site-level micro-pKa predictions (acidic & basic).
+- Only real database data or ML predictions are used for pKa — no heuristic
+  SMARTS-based pKa values.
+- SMARTS patterns are used solely for structural classification (acid / base /
+  ampholyte / non-ionizable) and functional group identification.
 - For polyphenols / multiprotic molecules, pKa column is left blank.
-- When pKa is uncertain, ionization and logD are left blank rather than faked.
+- When pKa is unavailable, ionization and logD are left blank.
 """
 
 from dataclasses import dataclass, field
@@ -97,31 +98,31 @@ class IonizableSite:
     name: str
     ion_type: IonType
     atom_indices: tuple[int, ...]
-    heuristic_pka: float
-    source: str = "heuristic"
 
 
 # ---------------------------------------------------------------------------
-# SMARTS patterns for site-aware heuristic pKa prediction
+# SMARTS patterns for structural classification (NOT used for pKa values)
+# These identify ionizable functional groups to classify molecules as
+# acid / base / ampholyte / non-ionizable, and to detect phenol / COOH sites.
 # ---------------------------------------------------------------------------
-_ACID_PATTERNS: list[tuple[str, str, float]] = [
-    ("[CX3](=O)[OX2H1]", "carboxylic_acid", 4.2),
-    ("[PX4](=O)([OX2H1])[OX2H1,OX1-]", "phosphate", 2.1),
-    ("[SX4](=O)(=O)[OX2H1]", "sulfonic_acid", -1.0),
-    ("[c][OX2H1]", "phenol", 9.9),
-    ("[SX2H1]", "thiol", 10.4),
-    ("[NX3][SX4](=O)(=O)[#6]", "sulfonamide", 9.5),
+_ACID_PATTERNS: list[tuple[str, str]] = [
+    ("[CX3](=O)[OX2H1]", "carboxylic_acid"),
+    ("[PX4](=O)([OX2H1])[OX2H1,OX1-]", "phosphate"),
+    ("[SX4](=O)(=O)[OX2H1]", "sulfonic_acid"),
+    ("[c][OX2H1]", "phenol"),
+    ("[SX2H1]", "thiol"),
+    ("[NX3][SX4](=O)(=O)[#6]", "sulfonamide"),
 ]
 
-_BASE_PATTERNS: list[tuple[str, str, float]] = [
-    ("[NX3H2;!$(NC=O);!$(NS(=O)(=O));!$(N[#6]=[!#6])][#6]", "primary_amine", 10.6),
-    ("[NX3H1;!$(NC=O);!$(NS(=O)(=O));!$([nH]);!$(N[#6]=[!#6])]([#6])[#6]", "secondary_amine", 10.8),
-    ("[NX3H0;!$(NC=O);!$(NS(=O)(=O));!$(N[#6]=[!#6])]([#6])([#6])[#6]", "tertiary_amine", 9.8),
-    ("[nX2H0;r5,r6]", "pyridine_like", 3.3),
-    ("[nH]1ccnc1", "imidazole_like", 6.9),
-    ("[$([CX3](=[NX2])([NX3])[NX3])]", "guanidine", 13.5),
-    ("[$([CX3](=[NX2])[NX3])]", "amidine", 11.5),
-    ("[NX3H2]c1ccccc1", "aniline_like", 5.0),
+_BASE_PATTERNS: list[tuple[str, str]] = [
+    ("[NX3H2;!$(NC=O);!$(NS(=O)(=O));!$(N[#6]=[!#6])][#6]", "primary_amine"),
+    ("[NX3H1;!$(NC=O);!$(NS(=O)(=O));!$([nH]);!$(N[#6]=[!#6])]([#6])[#6]", "secondary_amine"),
+    ("[NX3H0;!$(NC=O);!$(NS(=O)(=O));!$(N[#6]=[!#6])]([#6])([#6])[#6]", "tertiary_amine"),
+    ("[nX2H0;r5,r6]", "pyridine_like"),
+    ("[nH]1ccnc1", "imidazole_like"),
+    ("[$([CX3](=[NX2])([NX3])[NX3])]", "guanidine"),
+    ("[$([CX3](=[NX2])[NX3])]", "amidine"),
+    ("[NX3H2]c1ccccc1", "aniline_like"),
 ]
 
 
@@ -164,19 +165,19 @@ def _normalize_text(value: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Compiled SMARTS patterns (cached)
+# Compiled SMARTS patterns (cached) — for structural classification only
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
-def _compiled_patterns() -> list[tuple[Chem.Mol, str, IonType, float]]:
-    compiled: list[tuple[Chem.Mol, str, IonType, float]] = []
-    for smarts, name, pka in _ACID_PATTERNS:
+def _compiled_patterns() -> list[tuple[Chem.Mol, str, IonType]]:
+    compiled: list[tuple[Chem.Mol, str, IonType]] = []
+    for smarts, name in _ACID_PATTERNS:
         patt = Chem.MolFromSmarts(smarts)
         if patt is not None:
-            compiled.append((patt, name, "acid", pka))
-    for smarts, name, pka in _BASE_PATTERNS:
+            compiled.append((patt, name, "acid"))
+    for smarts, name in _BASE_PATTERNS:
         patt = Chem.MolFromSmarts(smarts)
         if patt is not None:
-            compiled.append((patt, name, "base", pka))
+            compiled.append((patt, name, "base"))
     return compiled
 
 
@@ -700,12 +701,13 @@ def _drugbank_match_status(entry: dict[str, Any] | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Part 2 — Site-aware heuristic pKa prediction
+# Structural classification — detect ionizable functional groups
 # ---------------------------------------------------------------------------
 def detect_ionizable_sites(mol: Chem.Mol) -> list[IonizableSite]:
+    """Identify ionizable functional groups via SMARTS (classification only)."""
     sites: list[IonizableSite] = []
     seen: set[tuple[str, tuple[int, ...]]] = set()
-    for patt, name, ion_type, heuristic_pka in _compiled_patterns():
+    for patt, name, ion_type in _compiled_patterns():
         for match in mol.GetSubstructMatches(patt):
             key = (name, tuple(sorted(match)))
             if key in seen:
@@ -716,7 +718,6 @@ def detect_ionizable_sites(mol: Chem.Mol) -> list[IonizableSite]:
                     name=name,
                     ion_type=ion_type,
                     atom_indices=tuple(match),
-                    heuristic_pka=heuristic_pka,
                 )
             )
     return sites
@@ -774,10 +775,8 @@ def _decide_representative_pka(
     if n_acidic > 1:
         # Special case: carboxylic acid + phenols → COOH dominates first ionization
         if has_cooh and n_phenol >= 1 and n_acidic == (1 + n_phenol):
-            # The carboxylic acid is the strongest (lowest pKa); use it
-            cooh_pkas = [s.heuristic_pka for s in sites if s.name == "carboxylic_acid"]
-            if cooh_pkas:
-                return round(min(acidic_pkas), 2), None
+            # Use the lowest (most acidic) pKa — typically the COOH
+            return round(min(acidic_pkas), 2), None
         # Polyphenol or multi-acidic: no single pKa
         if n_phenol >= 2:
             return None, "multiprotic_or_no_single_representative_pKa"
@@ -907,7 +906,8 @@ def _dominant_charge_class(expected_net_charge: float | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# pKa source resolution: input → ChEMBL → PubChem → DrugBank → QupKake → heuristic
+# pKa source resolution: input → ChEMBL → DrugBank → PubChem → QupKake
+# No heuristic fallback — only real data or ML predictions.
 # ---------------------------------------------------------------------------
 def _site_pka_lists_from_source(
     *,
@@ -921,7 +921,7 @@ def _site_pka_lists_from_source(
 ) -> tuple[list[float], list[float], str, dict[str, Any]]:
     """Return acidic/basic pKa lists, source tag, and database metadata.
 
-    Cascade: input → ChEMBL → PubChem → DrugBank → QupKake → heuristic.
+    Cascade: input → ChEMBL → DrugBank → PubChem → QupKake → (nothing).
 
     Returns
     -------
@@ -985,33 +985,7 @@ def _site_pka_lists_from_source(
             acidic, basic = _assign_single_pka(pka_val)
             return acidic, basic, "chembl", db_meta
 
-    # ── Priority 2: PubChem PUG-View (Dissociation Constants) ──
-    pubchem = _pubchem_lookup(
-        canonical_smiles=canonical_smiles,
-        name=name,
-        inchikey=inchikey,
-    )
-    if pubchem is not None:
-        db_meta["pubchem_cid"] = pubchem.get("pubchem_cid")
-        pka_vals = pubchem.get("pubchem_pka_values", [])
-        db_meta["pubchem_pka_values"] = pka_vals
-
-        if pka_vals:
-            # PubChem may return multiple pKa values; separate into acidic/basic
-            # using site detection as a guide
-            ion_class = classify_ionization(sites)
-            if ion_class == "base":
-                return [], pka_vals, "pubchem", db_meta
-            elif ion_class == "ampholyte":
-                # With multiple values, assign lowest as acidic, highest as basic
-                sorted_vals = sorted(pka_vals)
-                mid = len(sorted_vals) // 2
-                return sorted_vals[:mid] or sorted_vals[:1], sorted_vals[mid:] or [], "pubchem", db_meta
-            else:
-                # acid or non_ionizable with pKa data → treat as acidic
-                return pka_vals, [], "pubchem", db_meta
-
-    # ── Priority 3: DrugBank web-scraping ──
+    # ── Priority 2: DrugBank web-scraping ──
     entry = _live_drugbank_lookup(
         canonical_smiles=canonical_smiles,
         name=name,
@@ -1043,6 +1017,28 @@ def _site_pka_lists_from_source(
     # If DrugBank match is uncertain, do NOT use its pKa — fall through
     # but keep the metadata for provenance
 
+    # ── Priority 3: PubChem PUG-View (Dissociation Constants) ──
+    pubchem = _pubchem_lookup(
+        canonical_smiles=canonical_smiles,
+        name=name,
+        inchikey=inchikey,
+    )
+    if pubchem is not None:
+        db_meta["pubchem_cid"] = pubchem.get("pubchem_cid")
+        pka_vals = pubchem.get("pubchem_pka_values", [])
+        db_meta["pubchem_pka_values"] = pka_vals
+
+        if pka_vals:
+            ion_class = classify_ionization(sites)
+            if ion_class == "base":
+                return [], pka_vals, "pubchem", db_meta
+            elif ion_class == "ampholyte":
+                sorted_vals = sorted(pka_vals)
+                mid = len(sorted_vals) // 2
+                return sorted_vals[:mid] or sorted_vals[:1], sorted_vals[mid:] or [], "pubchem", db_meta
+            else:
+                return pka_vals, [], "pubchem", db_meta
+
     # ── Priority 4: QupKake ML-based site-aware predictor ──
     if canonical_smiles:
         qupkake_result = _qupkake_predict(canonical_smiles)
@@ -1054,10 +1050,8 @@ def _site_pka_lists_from_source(
                 db_meta,
             )
 
-    # ── Priority 5: SMARTS-based heuristic pKa prediction (fallback) ──
-    acidic = [s.heuristic_pka for s in sites if s.ion_type == "acid"]
-    basic = [s.heuristic_pka for s in sites if s.ion_type == "base"]
-    return acidic, basic, "heuristic_site_rules", db_meta
+    # ── No pKa source found — return empty ──
+    return [], [], "not_found", db_meta
 
 
 # ---------------------------------------------------------------------------
@@ -1086,32 +1080,17 @@ def _assess_pka_confidence(
     if pka_source == "chembl":
         return "moderate"  # ChemAxon predicted values
     if pka_source == "qupkake":
-        return "moderate"  # ML-predicted, better than heuristic
+        return "moderate"  # ML-predicted
 
-    # Heuristic site rules or non-ionizable
+    # Non-ionizable molecules don't need pKa
     if ion_class == "non_ionizable":
         return "high"
 
-    # Simple monoprotic → moderate confidence for heuristic
-    if (n_acidic == 1 and n_basic == 0) or (n_basic == 1 and n_acidic == 0):
-        if n_phenol == 0:
-            return "moderate"
-        # Single phenol is less reliable
-        return "low"
+    # No pKa source found — ionizable but we have no data
+    if pka_source == "not_found":
+        return "none"
 
-    # Polyphenols — but COOH + phenols is a known pattern where COOH dominates
-    if n_phenol >= 2:
-        if _has_carboxylic_acid_from_counts(n_acidic, n_phenol):
-            # COOH pKa is well-established; phenols are weaker — moderate
-            return "moderate"
-        return "low"
-
-    # Multiprotic / complex
-    if n_acidic + n_basic > 2:
-        if _has_carboxylic_acid_from_counts(n_acidic, n_phenol):
-            return "moderate"
-        return "low"
-
+    # Fallback for any other unexpected source
     return "moderate"
 
 
@@ -1133,7 +1112,7 @@ def analyze_ionization(
     """Analyze ionization and pH-corrected lipophilicity for one molecule.
 
     Implements the full pipeline:
-    ChEMBL → PubChem → DrugBank → QupKake → heuristic pKa → Dimorphite-DL → ionization → logD
+    input → ChEMBL → DrugBank → PubChem → QupKake → Dimorphite-DL → ionization → logD
     """
     try:
         inchikey = inchi.MolToInchiKey(mol)
@@ -1196,14 +1175,13 @@ def analyze_ionization(
         logd = None
         logd_method = "unavailable_due_to_missing_pKa"
         ionization_status = "uncertain"
-    elif pka_confidence == "low" and pka_source == "heuristic_site_rules":
-        # Low confidence heuristic pKa → do NOT fake ionization or logD
-        # Per spec: when pKa is uncertain, leave ionization and logD blank
+    elif pka_confidence == "none":
+        # No pKa data found from any source — leave ionization/logD blank
         fraction_unionized = None
         fraction_ionized = None
         expected_net_charge = None
         logd = None
-        logd_method = "unavailable_due_to_uncertain_ionization"
+        logd_method = "unavailable_no_pKa_data"
         ionization_status = "uncertain"
     else:
         # Normal computation with reasonable confidence
