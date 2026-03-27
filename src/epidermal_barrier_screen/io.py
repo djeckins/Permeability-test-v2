@@ -68,6 +68,8 @@ def _record_from_mol(mol: Chem.Mol | None, input_smiles: str | None = None) -> d
             "input_type": "smiles",
             "matched_name": None,
             "resolution_source": None,
+            "source_name": None,
+            "source_identifier": None,
             "resolution_confidence": "none",
             "resolution_notes": "invalid_smiles",
         }
@@ -89,6 +91,8 @@ def _record_from_mol(mol: Chem.Mol | None, input_smiles: str | None = None) -> d
         "input_type": "smiles",
         "matched_name": None,
         "resolution_source": "rdkit",
+        "source_name": "rdkit",
+        "source_identifier": "rdkit_canonicalization",
         "resolution_confidence": "high",
         "resolution_notes": None,
     }
@@ -139,6 +143,8 @@ def _parse_smiles_or_name(text: str) -> dict[str, Any]:
         "input_type": input_type,
         "matched_name": resolved.matched_name,
         "resolution_source": resolved.source_name,
+        "source_name": resolved.source_name,
+        "source_identifier": resolved.source_identifier,
         "resolution_confidence": resolved.resolution_confidence,
         "resolution_notes": resolved.resolution_notes,
     }
