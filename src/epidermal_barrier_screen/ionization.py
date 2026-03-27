@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-"""Ionization analysis: ChEMBL → DrugBank → PubChem → QupKake → Dimorphite-DL → ionization → logD.
+"""Ionization analysis: PubChem → DrugBank → ChEMBL → QupKake → Dimorphite-DL → ionization → logD.
 
 Pipeline
 --------
 1. Canonicalize molecule (caller provides canonical SMILES).
-2. Try ChEMBL API lookup (by InChIKey / canonical SMILES / name).
-3. If no ChEMBL match → try DrugBank web lookup.
-4. If no DrugBank match → try PubChem PUG-View (Dissociation Constants).
-5. If no PubChem match → try QupKake ML-based site-aware pKa predictor.
+2. Try PubChem PUG-View lookup (Dissociation Constants annotations).
+3. If no PubChem match → try DrugBank web lookup.
+4. If no DrugBank match → try ChEMBL API lookup (by InChIKey / SMILES / name).
+5. If no database pKa found → try QupKake ML-based site-aware pKa predictor.
 6. If no pKa found anywhere → leave pKa / ionization / logD blank.
 7. Run Dimorphite-DL around user pH for protonation-state enumeration.
 8. Decide whether one representative pKa is chemically meaningful.
@@ -906,7 +906,7 @@ def _dominant_charge_class(expected_net_charge: float | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# pKa source resolution: input → ChEMBL → DrugBank → PubChem → QupKake
+# pKa source resolution: input → PubChem → DrugBank → ChEMBL → QupKake
 # No heuristic fallback — only real data or ML predictions.
 # ---------------------------------------------------------------------------
 def _site_pka_lists_from_source(
@@ -921,7 +921,7 @@ def _site_pka_lists_from_source(
 ) -> tuple[list[float], list[float], str, dict[str, Any]]:
     """Return acidic/basic pKa lists, source tag, and database metadata.
 
-    Cascade: input → ChEMBL → DrugBank → PubChem → QupKake → (nothing).
+    Cascade: input → PubChem → DrugBank → ChEMBL → QupKake → (nothing).
 
     Returns
     -------
@@ -969,21 +969,27 @@ def _site_pka_lists_from_source(
             return [], [pka_val]
         return [pka_val], []
 
-    # ── Priority 1: ChEMBL API ──
-    chembl = _chembl_lookup(
+    # ── Priority 1: PubChem PUG-View (Dissociation Constants) ──
+    pubchem = _pubchem_lookup(
         canonical_smiles=canonical_smiles,
         name=name,
         inchikey=inchikey,
     )
-    if chembl is not None:
-        db_meta["chembl_id"] = chembl.get("chembl_id")
-        db_meta["chembl_name"] = chembl.get("chembl_name")
-        db_meta["chembl_acd_pka"] = chembl.get("chembl_acd_pka")
+    if pubchem is not None:
+        db_meta["pubchem_cid"] = pubchem.get("pubchem_cid")
+        pka_vals = pubchem.get("pubchem_pka_values", [])
+        db_meta["pubchem_pka_values"] = pka_vals
 
-        pka_val = chembl["chembl_acd_pka"]
-        if pka_val is not None:
-            acidic, basic = _assign_single_pka(pka_val)
-            return acidic, basic, "chembl", db_meta
+        if pka_vals:
+            ion_class = classify_ionization(sites)
+            if ion_class == "base":
+                return [], pka_vals, "pubchem", db_meta
+            elif ion_class == "ampholyte":
+                sorted_vals = sorted(pka_vals)
+                mid = len(sorted_vals) // 2
+                return sorted_vals[:mid] or sorted_vals[:1], sorted_vals[mid:] or [], "pubchem", db_meta
+            else:
+                return pka_vals, [], "pubchem", db_meta
 
     # ── Priority 2: DrugBank web-scraping ──
     entry = _live_drugbank_lookup(
@@ -1017,27 +1023,21 @@ def _site_pka_lists_from_source(
     # If DrugBank match is uncertain, do NOT use its pKa — fall through
     # but keep the metadata for provenance
 
-    # ── Priority 3: PubChem PUG-View (Dissociation Constants) ──
-    pubchem = _pubchem_lookup(
+    # ── Priority 3: ChEMBL API ──
+    chembl = _chembl_lookup(
         canonical_smiles=canonical_smiles,
         name=name,
         inchikey=inchikey,
     )
-    if pubchem is not None:
-        db_meta["pubchem_cid"] = pubchem.get("pubchem_cid")
-        pka_vals = pubchem.get("pubchem_pka_values", [])
-        db_meta["pubchem_pka_values"] = pka_vals
+    if chembl is not None:
+        db_meta["chembl_id"] = chembl.get("chembl_id")
+        db_meta["chembl_name"] = chembl.get("chembl_name")
+        db_meta["chembl_acd_pka"] = chembl.get("chembl_acd_pka")
 
-        if pka_vals:
-            ion_class = classify_ionization(sites)
-            if ion_class == "base":
-                return [], pka_vals, "pubchem", db_meta
-            elif ion_class == "ampholyte":
-                sorted_vals = sorted(pka_vals)
-                mid = len(sorted_vals) // 2
-                return sorted_vals[:mid] or sorted_vals[:1], sorted_vals[mid:] or [], "pubchem", db_meta
-            else:
-                return pka_vals, [], "pubchem", db_meta
+        pka_val = chembl["chembl_acd_pka"]
+        if pka_val is not None:
+            acidic, basic = _assign_single_pka(pka_val)
+            return acidic, basic, "chembl", db_meta
 
     # ── Priority 4: QupKake ML-based site-aware predictor ──
     if canonical_smiles:
@@ -1112,7 +1112,7 @@ def analyze_ionization(
     """Analyze ionization and pH-corrected lipophilicity for one molecule.
 
     Implements the full pipeline:
-    input → ChEMBL → DrugBank → PubChem → QupKake → Dimorphite-DL → ionization → logD
+    input → PubChem → DrugBank → ChEMBL → QupKake → Dimorphite-DL → ionization → logD
     """
     try:
         inchikey = inchi.MolToInchiKey(mol)
@@ -1213,6 +1213,15 @@ def analyze_ionization(
     fraction_ionized = None if fraction_ionized is None else round(float(fraction_ionized), 4)
     dominant_charge_class = _dominant_charge_class(expected_net_charge)
 
+    # --- Build warnings list ---
+    warnings_list: list[str] = []
+    if pka_source == "not_found" and ion_class != "non_ionizable":
+        warnings_list.append("no_pKa_from_any_source")
+    if db_meta.get("drugbank_match_status") == "uncertain":
+        warnings_list.append("drugbank_match_uncertain_pKa_not_used")
+    if ionization_status == "uncertain":
+        warnings_list.append("ionization_uncertain")
+
     # --- Build result ---
     ionizable_groups = [s.name for s in sites]
 
@@ -1230,7 +1239,8 @@ def analyze_ionization(
         "pka_confidence": pka_confidence,
         "pka_note": pka_note,
         "lookup_match_name": (
-            db_meta.get("chembl_name")
+            db_meta.get("pubchem_name")
+            or db_meta.get("chembl_name")
             or db_meta.get("drugbank_name")
             or name
         ),
@@ -1266,6 +1276,15 @@ def analyze_ionization(
         # LogD
         "logd": logd,
         "logd_method": logd_method,
+        # New provenance fields
+        "used_qupkake_fallback": pka_source == "qupkake",
+        "logp_value": clogp,
+        "logp_source": "rdkit_crippen",
+        "logp_evidence_type": "computed",
+        "pka_values": "; ".join(
+            f"{v:.2f}" for v in (acidic_pkas + basic_pkas)
+        ) if (acidic_pkas or basic_pkas) else None,
+        "warnings": "; ".join(warnings_list) if warnings_list else None,
     }
 
     return result

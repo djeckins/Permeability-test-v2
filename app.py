@@ -502,11 +502,12 @@ file_name: str | None = None
 
 with tab_smiles:
     st.markdown(
-        "Enter a **single SMILES** or a **list of SMILES** (one per line, optional name after a space):"
+        "Enter a **SMILES**, a **compound name**, or a **list** (one per line).\n"
+        "Names are automatically resolved to structures via PubChem."
     )
     smiles_text = st.text_area(
-        label="SMILES input",
-        placeholder="CC(=O)Oc1ccccc1C(=O)O  Aspirin\nCCO  Ethanol\nCN1CCC[C@H]1c2cccnc2  Nicotine",
+        label="SMILES or name input",
+        placeholder="caffeic acid\nCC(=O)Oc1ccccc1C(=O)O  Aspirin\nibuprofen\nCCO  Ethanol",
         height=160,
         label_visibility="collapsed",
     )
@@ -656,12 +657,14 @@ with st.expander("📋  Screening criteria reference"):
         | **Charge at pH {current_ph:.1f}** | neutral / near-neutral | about ±1 | multi-charged |
         | **Ionization (pH {current_ph:.1f})** | f_unionized ≥ 0.8 | 0.5–0.8 | < 0.5 |
 
+        Name resolution: compound names are resolved to SMILES via **PubChem PUG REST**.
+
         pKa pipeline in this build:
         1. `input_pka_acidic` / `input_pka_basic` / `input_pka` from the file
-        2. **ChEMBL** API lookup (molecule properties, InChIKey / SMILES / name)
+        2. **PubChem** PUG-View lookup (Dissociation Constants annotations)
         3. **DrugBank** web lookup by compound name (public page parsing)
-        4. **PubChem** PUG-View lookup (Dissociation Constants annotations)
-        5. **QupKake** ML-based site-aware pKa predictor (if installed)
+        4. **ChEMBL** API lookup (molecule properties, InChIKey / SMILES / name)
+        5. **QupKake** ML-based site-aware pKa predictor (if installed, DB-fallback only)
         6. **Dimorphite-DL** protonation state enumeration at the selected pH
         7. pH-specific ionization and logD calculation
 
