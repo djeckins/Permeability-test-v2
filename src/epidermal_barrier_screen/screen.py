@@ -178,8 +178,11 @@ def screen_records(
             "input_type": rec.get("input_type", "smiles"),
             "matched_name": rec.get("matched_name"),
             "resolution_source": rec.get("resolution_source"),
+            "source_name": rec.get("source_name") or rec.get("resolution_source"),
+            "source_identifier": rec.get("source_identifier"),
             "resolution_confidence": rec.get("resolution_confidence"),
             "resolution_notes": rec.get("resolution_notes"),
+            "molecular_formula": rec.get("resolved_molecular_formula"),
         }
 
         if rec.get("parse_status") != "ok" or rec.get("mol") is None:
@@ -203,6 +206,9 @@ def screen_records(
             input_logd_7_4=rec.get("input_logd_7_4"),
         )
         row.update(ion)
+        obs = ion.get("pka_observations") or []
+        if obs:
+            row["pka_details"] = "; ".join(f"{o.source}:{o.pka_value:.2f}:{o.site_type}" for o in obs)
         row["ph_used"] = round(float(ph), 2)
 
         row["mw_status"] = _mw_status(desc["mw"])
@@ -230,6 +236,9 @@ def screen_records(
             if entries:
                 identity = {
                     "name": rec.get("name"),
+                    "input_name": rec.get("input_name"),
+                    "input_type": rec.get("input_type"),
+                    "matched_name": rec.get("matched_name"),
                     "canonical_smiles": rec.get("canonical_smiles"),
                     "inchikey": ion.get("inchikey"),
                 }
@@ -312,12 +321,16 @@ def screen_records(
         "input_type",
         "matched_name",
         "resolution_source",
+        "source_name",
+        "source_identifier",
         "resolution_confidence",
         "resolution_notes",
+        "molecular_formula",
         "logp_value",
         "logp_source",
         "logp_evidence_type",
         "pka_values",
+        "pka_details",
         "used_qupkake_fallback",
         "warnings",
     ]
